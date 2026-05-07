@@ -2,7 +2,7 @@
 
 > A sousveillant transparency layer for MCP agents
 
-[![CI](https://github.com/abdulahad014993/SousMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/abdulahad014993/SousMCP/actions/workflows/ci.yml)
+[![CI](https://github.com/abdulahad014993-bot-bot/SousMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/abdulahad014993-bot-bot/SousMCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue)](https://www.typescriptlang.org)
@@ -78,7 +78,7 @@ packages/
 **Requirements:** Node.js ≥ 22.0.0, npm ≥ 9
 
 ```bash
-git clone https://github.com/abdulahad014993/SousMCP.git
+git clone https://github.com/abdulahad014993-bot-bot/SousMCP.git
 cd SousMCP
 npm install
 npm run build
@@ -191,4 +191,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE) © abdulahad014993
+[MIT](LICENSE) © abdulahad014993-bot

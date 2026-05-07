@@ -3,7 +3,7 @@
 ## Getting started
 
 ```bash
-git clone https://github.com/abdulahad014993/SousMCP.git
+git clone https://github.com/abdulahad014993-bot/SousMCP.git
 cd SousMCP
 npm install
 npm run build
