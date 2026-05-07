@@ -1,0 +1,28 @@
+{
+  "name": "@sousmcp/proxy",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@sousmcp/shared": "*",
+    "chalk": "^4.1.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "js-yaml": "^4.1.0",
+    "node-notifier": "^10.0.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/node-notifier": "^8.0.5",
+    "typescript": "^5.4.0"
+  }
+}
