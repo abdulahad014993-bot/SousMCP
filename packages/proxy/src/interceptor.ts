@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { log } from "./logger.js";
 import type {
   CleanupFn,
   InboundResult,
@@ -11,50 +12,45 @@ import type {
 
 function makeMessage(raw: string, direction: MessageDirection): InterceptedMessage {
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = null;
-  }
+  try { parsed = JSON.parse(raw); } catch { parsed = null; }
   return { direction, timestamp: new Date().toISOString(), raw, parsed };
 }
 
 // ── Outbound pipe (child → host) ───────────────────────────────────────────
-// Forwards raw bytes immediately and calls onOutbound for each complete line.
 
 function pipeOutbound(
   source: NodeJS.ReadableStream,
   onOutbound: (msg: InterceptedMessage) => void
 ): void {
   let buffer = "";
-
-  (source as NodeJS.ReadableStream & { setEncoding(enc: string): void }).setEncoding("utf8");
+  (source as NodeJS.ReadableStream & { setEncoding(e: string): void }).setEncoding("utf8");
 
   source.on("data", (chunk: string) => {
-    // Forward raw bytes before parsing so latency is minimal.
-    process.stdout.write(chunk);
-
+    process.stdout.write(chunk); // forward immediately — latency matters
     buffer += chunk;
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trimEnd();
-      if (trimmed) onOutbound(makeMessage(trimmed, "outbound"));
+      if (!trimmed) continue;
+      try { onOutbound(makeMessage(trimmed, "outbound")); } catch (err) {
+        log("error", `onOutbound error: ${String(err)}`);
+      }
     }
   });
 
   source.on("end", () => {
     const trimmed = buffer.trimEnd();
-    if (trimmed) onOutbound(makeMessage(trimmed, "outbound"));
+    if (trimmed) {
+      try { onOutbound(makeMessage(trimmed, "outbound")); } catch { /* ignore */ }
+    }
     buffer = "";
   });
 }
 
 // ── Inbound pipe (host → child) ────────────────────────────────────────────
-// Parses each complete line, awaits onInbound, then either forwards to the
-// child or writes an error response back to the host.  Messages are processed
-// strictly in order via a serial promise queue so a pause in onInbound
-// naturally stalls later messages without losing them.
+// Serial queue ensures messages are processed in order.
+// If the handler throws, the message is forwarded anyway (fail-open).
 
 function pipeInbound(
   source: NodeJS.ReadableStream,
@@ -64,12 +60,16 @@ function pipeInbound(
   let buffer = "";
   let queue = Promise.resolve();
 
-  (source as NodeJS.ReadableStream & { setEncoding(enc: string): void }).setEncoding("utf8");
+  (source as NodeJS.ReadableStream & { setEncoding(e: string): void }).setEncoding("utf8");
 
   function enqueue(raw: string): void {
     queue = queue.then(async () => {
-      const msg = makeMessage(raw, "inbound");
-      const result = await onInbound(msg);
+      let result: InboundResult = { action: "forward" }; // fail-open default
+      try {
+        result = await onInbound(makeMessage(raw, "inbound"));
+      } catch (err) {
+        log("error", `onInbound error — forwarding anyway: ${String(err)}`);
+      }
 
       if (result.action === "forward") {
         if (!(childStdin as NodeJS.WritableStream & { destroyed: boolean }).destroyed) {
@@ -79,7 +79,7 @@ function pipeInbound(
         process.stdout.write(result.errorResponse + "\n");
       }
     }).catch((err: unknown) => {
-      process.stderr.write(`[sousmcp] inbound handler error: ${String(err)}\n`);
+      log("error", `inbound queue error: ${String(err)}`);
     });
   }
 
@@ -109,15 +109,22 @@ export function startStdioProxy(options: StartStdioProxyOptions): CleanupFn {
     stdio: ["pipe", "pipe", "inherit"],
   });
 
+  child.on("error", (err) => {
+    log("error", `Child process error: ${String(err)}`);
+  });
+
   pipeInbound(process.stdin, child.stdin, onInbound);
   pipeOutbound(child.stdout!, onOutbound);
 
   child.on("exit", (code, signal) => {
+    log("info", `Child exited: code=${code} signal=${signal}`);
     process.exitCode = code ?? 1;
-    if (signal) process.kill(process.pid, signal);
+    if (signal) {
+      try { process.kill(process.pid, signal); } catch { /* ignore */ }
+    }
   });
 
   return () => {
-    if (!child.killed) child.kill();
+    try { if (!child.killed) child.kill(); } catch { /* ignore */ }
   };
 }

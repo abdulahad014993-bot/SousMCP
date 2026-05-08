@@ -1,10 +1,15 @@
-import chalk from "chalk";
+// ── SousMCP proxy daemon ───────────────────────────────────────────────────
+// stdout and stderr are sacred — they carry the MCP data channel.
+// All operational output goes to ~/.sousmcp/sousmcp.log.
+
 import { startStdioProxy } from "./interceptor.js";
 import { LogStore } from "./store.js";
 import { PolicyEngine } from "./policy.js";
-import { pauseForApproval } from "./notify.js";
+import { pauseForApproval, notifyLearningMode } from "./notify.js";
 import { startApiServer } from "./server.js";
-import { printLastMessages } from "./display.js";
+import { loadConfig, isLearningMode, SOUSMCP_DIR } from "./config.js";
+import { log, logError, setLogFile } from "./logger.js";
+import * as fs from "node:fs";
 import type { InterceptedMessage, InboundResult } from "@sousmcp/shared";
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -16,22 +21,24 @@ if (!targetCommand) {
   process.exit(1);
 }
 
-const dbPath = process.env["SOUSMCP_DB"] ?? "./sousmcp.db";
-const store = new LogStore(dbPath);
-const policy = new PolicyEngine();
+// Ensure the config directory exists so logging works from the start.
+try { fs.mkdirSync(SOUSMCP_DIR, { recursive: true }); } catch { /* ignore */ }
+
+const cfg = loadConfig();
+setLogFile(cfg.logPath);
+
+const store = new LogStore(cfg.dbPath);
+const learningMode = isLearningMode(cfg);
+const policy = new PolicyEngine(undefined, learningMode);
 
 const serverCommand = [targetCommand, ...targetArgs].join(" ");
 const sessionId = store.createSession("host", targetCommand, serverCommand);
 
-process.stderr.write(
-  chalk.bold.cyan("SousMCP proxy starting\n") +
-  chalk.dim(`  target:  ${serverCommand}\n`) +
-  chalk.dim(`  db:      ${dbPath}\n`) +
-  chalk.dim(`  session: ${sessionId}\n`) +
-  chalk.dim(`  policy:  ${policy.filePath}\n`)
-);
+log("info", `Proxy starting — target: ${serverCommand} session: ${sessionId} learning: ${learningMode}`);
 
-startApiServer(store, policy);
+try { startApiServer(store, policy, cfg.apiPort); } catch (err) {
+  log("warn", `API server failed to start: ${String(err)}`);
+}
 
 // ── JSON-RPC helpers ───────────────────────────────────────────────────────
 
@@ -61,60 +68,74 @@ function extractId(parsed: unknown): unknown {
 }
 
 function jsonRpcError(id: unknown, message: string): string {
-  return JSON.stringify({
-    jsonrpc: "2.0",
-    id,
-    error: { code: -32603, message },
-  });
+  return JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32603, message } });
 }
 
-// ── Inbound handler (host → child) ─────────────────────────────────────────
+// ── Inbound handler ────────────────────────────────────────────────────────
 
 async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
   const method = extractMethod(msg.parsed);
   const params = extractParams(msg.parsed);
   const id = extractId(msg.parsed);
-  const { action, rule } = policy.evaluate(msg.parsed);
+
+  let evalResult;
+  try {
+    evalResult = policy.evaluate(msg.parsed);
+  } catch (err) {
+    logError(err, "Policy evaluation");
+    evalResult = { action: "log" as const, learningModeOverride: false };
+  }
+
+  const { action, rule, learningModeOverride } = evalResult;
+
+  // Notify in learning mode when a rule would have fired.
+  if (learningModeOverride && rule) {
+    try { notifyLearningMode(msg, rule, rule.action); } catch { /* non-fatal */ }
+  }
 
   if (action === "block") {
-    const ruleName = rule?.name ?? "default";
-    process.stderr.write(chalk.red(`[BLOCK] ${ruleName}: ${method}\n`));
-    store.logMessage(sessionId, msg.direction, method, params, null, "block");
-    return {
-      action: "block",
-      errorResponse: jsonRpcError(id, `Blocked by SousMCP policy: ${ruleName}`),
-    };
+    const ruleName = rule?.name ?? "policy";
+    log("info", `BLOCK ${ruleName}: ${method}`);
+    try { store.logMessage(sessionId, msg.direction, method, params, null, "block"); } catch (err) {
+      logError(err, "DB write (block)");
+    }
+    return { action: "block", errorResponse: jsonRpcError(id, `Blocked by SousMCP: ${ruleName}`) };
   }
 
   if (action === "pause") {
-    const decision = pauseForApproval(msg, rule!);
-    if (decision === "deny") {
-      const ruleName = rule?.name ?? "default";
-      store.logMessage(sessionId, msg.direction, method, params, null, "pause:denied");
-      return {
-        action: "block",
-        errorResponse: jsonRpcError(id, `Denied by user via SousMCP policy: ${ruleName}`),
-      };
+    let decision: "approve" | "deny" = "approve";
+    try { decision = pauseForApproval(msg, rule!); } catch (err) {
+      logError(err, "Pause approval — defaulting to approve");
     }
-    store.logMessage(sessionId, msg.direction, method, params, null, "pause:approved");
+    const policyAction = decision === "deny" ? "pause:denied" : "pause:approved";
+    try { store.logMessage(sessionId, msg.direction, method, params, null, policyAction); } catch (err) {
+      logError(err, "DB write (pause)");
+    }
+    if (decision === "deny") {
+      return { action: "block", errorResponse: jsonRpcError(id, `Denied by user: ${rule?.name ?? "policy"}`) };
+    }
     return { action: "forward" };
   }
 
-  // action === "log" — forward transparently, record policyAction only if a rule fired.
-  const policyAction = rule ? "log" : null;
-  store.logMessage(sessionId, msg.direction, method, params, null, policyAction);
+  // log / learning-mode-override — forward and record
+  const policyAction = learningModeOverride ? `learning:${rule?.action ?? "log"}` : (rule ? "log" : null);
+  try { store.logMessage(sessionId, msg.direction, method, params, null, policyAction); } catch (err) {
+    logError(err, "DB write");
+  }
   return { action: "forward" };
 }
 
-// ── Outbound handler (child → host) ────────────────────────────────────────
+// ── Outbound handler ───────────────────────────────────────────────────────
 
 function onOutbound(msg: InterceptedMessage): void {
   const method = extractMethod(msg.parsed);
   const params = extractParams(msg.parsed);
-  store.logMessage(sessionId, msg.direction, method, params);
+  try { store.logMessage(sessionId, msg.direction, method, params); } catch (err) {
+    logError(err, "DB write (outbound)");
+  }
 }
 
-// ── Start proxy ────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────────
 
 const cleanup = startStdioProxy({ targetCommand, targetArgs, onInbound, onOutbound });
 
@@ -125,9 +146,9 @@ let shuttingDown = false;
 function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  cleanup();
-  printLastMessages(store, sessionId, 10);
-  store.close();
+  try { cleanup(); } catch { /* ignore */ }
+  log("info", `Session ${sessionId} ended`);
+  try { store.close(); } catch { /* ignore */ }
 }
 
 process.on("SIGINT", shutdown);

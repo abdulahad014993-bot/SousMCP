@@ -6,9 +6,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc --build",
-    "dev": "npm run dev --workspaces --if-present",
-    "lint": "tsc --noEmit"
+    "build": "node_modules/.bin/tsc --build packages/shared/tsconfig.json && node_modules/.bin/tsc --build packages/proxy/tsconfig.json",
+    "dev": "node_modules/.bin/tsc --build packages/shared/tsconfig.json && node_modules/.bin/tsc -p packages/proxy/tsconfig.json --watch",
+    "lint": "node_modules/.bin/tsc --build packages/shared/tsconfig.json --dry && node_modules/.bin/tsc -p packages/proxy/tsconfig.json --noEmit",
+    "test": "node packages/proxy/dist/index.js --help 2>/dev/null || node -e \"const {LogStore}=require('./packages/proxy/dist/store.js');const s=new LogStore(':memory:');console.log('store OK, chain:',s.verifyChain());s.close()\""
   },
   "devDependencies": {
     "typescript": "^5.4.0"

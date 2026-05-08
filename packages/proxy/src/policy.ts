@@ -16,30 +16,61 @@ export interface PolicyRule {
 export interface EvaluationResult {
   action: PolicyAction;
   rule?: PolicyRule;
+  learningModeOverride: boolean;
 }
 
 interface PoliciesFile {
   rules: PolicyRule[];
 }
 
-// ── Default policy document ────────────────────────────────────────────────
+// ── Default policies ───────────────────────────────────────────────────────
 
-const DEFAULT_POLICIES = `# SousMCP default policies
-# Evaluated top-to-bottom; first match wins.
+const DEFAULT_POLICIES = `# SousMCP policies — evaluated top-to-bottom, first match wins.
 # action: log | pause | block
+#
+# Learning mode: when enabled in ~/.sousmcp/config.json, all block/pause
+# rules are downgraded to log+notify so you can see what your agents do
+# before committing to strict enforcement.
+
 rules:
+  # ── Block sensitive credential stores ─────────────────────────────────────
   - name: block-ssh-reads
     matchMethod: "tools/call"
-    matchToolName: "read_file"
-    matchArgPattern: "\\\\.ssh"
+    matchArgPattern: "\\\\.ssh[\\\\/]"
     action: block
 
-  - name: block-env-reads
+  - name: block-gnupg-reads
     matchMethod: "tools/call"
-    matchToolName: "read_file"
-    matchArgPattern: "\\\\.env"
+    matchArgPattern: "\\\\.gnupg[\\\\/]"
     action: block
 
+  - name: block-aws-reads
+    matchMethod: "tools/call"
+    matchArgPattern: "\\\\.aws[\\\\/]"
+    action: block
+
+  # ── Pause before destructive shell commands ────────────────────────────────
+  - name: pause-rm-rf
+    matchMethod: "tools/call"
+    matchArgPattern: "rm\\\\s+-[rRfF]"
+    action: pause
+
+  - name: pause-force-push
+    matchMethod: "tools/call"
+    matchArgPattern: "git\\\\s+push.*--force"
+    action: pause
+
+  - name: pause-drop-table
+    matchMethod: "tools/call"
+    matchArgPattern: "(?i)drop\\\\s+table"
+    action: pause
+
+  - name: pause-curl-pipe-shell
+    matchMethod: "tools/call"
+    matchArgPattern: "curl[^|]*\\\\|\\\\s*(sh|bash|zsh)"
+    action: pause
+
+  # ── Pause before communication / external effects ──────────────────────────
   - name: pause-send-email
     matchMethod: "tools/call"
     matchToolName: "send_email"
@@ -50,11 +81,27 @@ rules:
     matchToolName: "send_message"
     action: pause
 
-  - name: pause-write-file
+  - name: pause-post-tweet
     matchMethod: "tools/call"
-    matchToolName: "write_file"
+    matchToolName: "post_tweet"
     action: pause
 
+  - name: pause-social-post
+    matchMethod: "tools/call"
+    matchArgPattern: "(?i)(post|tweet|publish).*social"
+    action: pause
+
+  - name: pause-delete-file
+    matchMethod: "tools/call"
+    matchToolName: "delete_file"
+    action: pause
+
+  - name: pause-purchase
+    matchMethod: "tools/call"
+    matchArgPattern: "(?i)(purchase|buy|checkout|payment)"
+    action: pause
+
+  # ── Log everything else ────────────────────────────────────────────────────
   - name: log-all
     matchMethod: "*"
     action: log
@@ -93,24 +140,24 @@ function getParamsJson(parsed: unknown): string {
 
 export class PolicyEngine {
   private rules: PolicyRule[] = [];
+  private learningMode: boolean;
   readonly filePath: string;
 
-  constructor(filePath?: string) {
+  constructor(filePath?: string, learningMode = false) {
     this.filePath = filePath ?? path.join(os.homedir(), ".sousmcp", "policies.yaml");
+    this.learningMode = learningMode;
     this.load();
   }
 
   private load(): void {
-    if (!fs.existsSync(this.filePath)) {
-      this.writeDefaults();
-    }
+    if (!fs.existsSync(this.filePath)) this.writeDefaults();
     const raw = fs.readFileSync(this.filePath, "utf8");
     const doc = yaml.load(raw) as PoliciesFile | null;
     this.rules = doc?.rules ?? [];
   }
 
   reload(): void {
-    this.load();
+    try { this.load(); } catch { /* leave rules as-is if reload fails */ }
   }
 
   private writeDefaults(): void {
@@ -118,9 +165,11 @@ export class PolicyEngine {
     fs.writeFileSync(this.filePath, DEFAULT_POLICIES, "utf8");
   }
 
-  getRules(): PolicyRule[] {
-    return this.rules;
+  setLearningMode(enabled: boolean): void {
+    this.learningMode = enabled;
   }
+
+  getRules(): PolicyRule[] { return this.rules; }
 
   setRules(rules: PolicyRule[]): void {
     this.rules = rules;
@@ -133,15 +182,24 @@ export class PolicyEngine {
     const paramsJson = getParamsJson(parsed);
 
     for (const rule of this.rules) {
-      // matchMethod: "*" is a wildcard; otherwise exact match
       if (rule.matchMethod !== "*" && rule.matchMethod !== method) continue;
       if (rule.matchToolName !== undefined && rule.matchToolName !== toolName) continue;
       if (rule.matchArgPattern !== undefined) {
-        if (!new RegExp(rule.matchArgPattern).test(paramsJson)) continue;
+        try {
+          if (!new RegExp(rule.matchArgPattern).test(paramsJson)) continue;
+        } catch {
+          continue; // bad regex — skip rule
+        }
       }
-      return { action: rule.action, rule };
+
+      const learningModeOverride = this.learningMode && rule.action !== "log";
+      return {
+        action: learningModeOverride ? "log" : rule.action,
+        rule,
+        learningModeOverride,
+      };
     }
 
-    return { action: "log" };
+    return { action: "log", learningModeOverride: false };
   }
 }
