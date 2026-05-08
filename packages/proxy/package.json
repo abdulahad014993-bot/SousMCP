@@ -1,20 +1,46 @@
 {
   "name": "@sousmcp/proxy",
   "version": "0.1.0",
-  "private": true,
+  "description": "A sousveillant transparency layer for MCP agents — intercepts, logs, and policy-gates every AI tool call",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-safety",
+    "claude",
+    "llm",
+    "proxy",
+    "audit",
+    "policy",
+    "transparency"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abdulahad014993-bot/SousMCP.git"
+  },
+  "author": "abdulahad014993-bot",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "scripts",
+    "README.md"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "sousmcp": "./dist/cli.js",
+    "sousmcp": "./bin/sousmcp.js",
     "sousmcp-proxy": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc --build",
     "dev": "tsc --watch",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "dependencies": {
-    "@sousmcp/shared": "*",
     "chalk": "^4.1.2",
     "cors": "^2.8.5",
     "express": "^4.19.0",
@@ -22,6 +48,7 @@
     "node-notifier": "^10.0.1"
   },
   "devDependencies": {
+    "@sousmcp/shared": "*",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/js-yaml": "^4.0.9",

@@ -25,8 +25,10 @@ const CLAUDE_CONFIG = path.join(
 );
 const CLAUDE_BACKUP = CLAUDE_CONFIG + ".sousmcp.bak";
 
-// The proxy daemon lives alongside this CLI in the same dist/ directory.
-const PROXY_SCRIPT = path.resolve(path.dirname(process.argv[1] ?? ""), "index.js");
+// The proxy daemon is always in dist/index.js alongside the compiled CLI.
+// __dirname is the dist/ dir in CommonJS output, regardless of how the CLI
+// was invoked (directly or through the bin/ wrapper).
+const PROXY_SCRIPT = path.resolve(__dirname, "index.js");
 const NODE_BIN = process.execPath;
 
 interface MCPServer {
@@ -59,12 +61,23 @@ function parseArgs(argv: string[]): { flags: Record<string, string>; positional:
   const flags: Record<string, string> = {};
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith("--")) {
-      const key = argv[i].slice(2);
-      flags[key] = argv[i + 1] ?? "";
-      i++;
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      if (eq !== -1) {
+        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+      } else {
+        const key = arg.slice(2);
+        const next = argv[i + 1];
+        if (next !== undefined && !next.startsWith("-")) {
+          flags[key] = next;
+          i++;
+        } else {
+          flags[key] = "true"; // boolean flag
+        }
+      }
     } else {
-      positional.push(argv[i]);
+      positional.push(arg);
     }
   }
   return { flags, positional };
@@ -227,18 +240,20 @@ async function cmdStatus(): Promise<void> {
   heading("SousMCP Status");
 
   // Installation
-  let installStatus = "not installed";
+  let installStatus = "Claude Desktop not found";
   if (fs.existsSync(CLAUDE_CONFIG)) {
     try {
       const claudeCfg = JSON.parse(fs.readFileSync(CLAUDE_CONFIG, "utf8")) as ClaudeConfig;
       const servers = Object.entries(claudeCfg.mcpServers ?? {});
       const wrapped = servers.filter(([, s]) => isWrapped(s));
       if (wrapped.length > 0) {
-        installStatus = `active (${wrapped.length} server${wrapped.length > 1 ? "s" : ""}: ${wrapped.map(([n]) => n).join(", ")})`;
+        installStatus = chalk.green(`active`) + ` (${wrapped.length} server${wrapped.length > 1 ? "s" : ""}: ${wrapped.map(([n]) => n).join(", ")})`;
+      } else if (servers.length === 0) {
+        installStatus = chalk.dim("no MCP servers in Claude Desktop config");
       } else {
-        installStatus = "not installed (run 'sousmcp install')";
+        installStatus = chalk.yellow("inactive") + " — run 'sousmcp install' to wrap servers";
       }
-    } catch { installStatus = "Claude config unreadable"; }
+    } catch { installStatus = chalk.red("Claude config is invalid JSON"); }
   }
   process.stdout.write(chalk.bold("Installation:  ") + installStatus + "\n");
 
@@ -350,8 +365,8 @@ async function cmdDigest(args: string[]): Promise<void> {
 async function cmdExport(args: string[]): Promise<void> {
   const { flags } = parseArgs(args);
 
-  if (!flags["from"] || !flags["to"] || !flags["out"]) {
-    err("Usage: sousmcp export --from YYYY-MM-DD --to YYYY-MM-DD --out report.json");
+  if (!flags["from"] || !flags["to"]) {
+    err("Usage: sousmcp export --from YYYY-MM-DD --to YYYY-MM-DD [--out report.json]");
     return;
   }
 
@@ -361,16 +376,18 @@ async function cmdExport(args: string[]): Promise<void> {
 
   to.setHours(23, 59, 59, 999);
 
+  const outFile = flags["out"] || "report.json";
+
   const cfg = loadConfig();
-  if (!fs.existsSync(cfg.dbPath)) { err("Database not found."); return; }
+  if (!fs.existsSync(cfg.dbPath)) { err("Database not found. Run 'sousmcp install' first."); return; }
 
   const store = new LogStore(cfg.dbPath);
-  const bundle = exportBundle(store, from, to, flags["out"]);
+  const bundle = exportBundle(store, from, to, outFile);
   store.close();
 
-  ok(`Exported ${bundle.messages.length} messages (${bundle.sessions.length} sessions) to ${flags["out"]}`);
+  ok(`Exported ${bundle.messages.length} messages (${bundle.sessions.length} sessions) to ${outFile}`);
   info(`Bundle hash: ${bundle.bundleHash}`);
-  info("Use 'sousmcp verify <file>' to verify integrity.");
+  info(`Use 'sousmcp verify ${outFile}' to verify integrity.`);
 }
 
 // ── sousmcp verify ─────────────────────────────────────────────────────────
@@ -501,6 +518,121 @@ async function cmdStart(): Promise<void> {
   await new Promise<never>(() => { /* block until signal */ });
 }
 
+// ── sousmcp doctor ─────────────────────────────────────────────────────────
+
+async function cmdDoctor(): Promise<void> {
+  heading("SousMCP Doctor");
+
+  let allOk = true;
+
+  function check(label: string, passed: boolean, fix?: string): void {
+    if (passed) {
+      process.stdout.write(chalk.green("✓ ") + label + "\n");
+    } else {
+      allOk = false;
+      process.stdout.write(chalk.red("✗ ") + label + "\n");
+      if (fix) info(`Fix: ${fix}`);
+    }
+  }
+
+  // 1. Node version
+  const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
+  check(
+    `Node.js ${process.versions.node} (requires ≥ 22)`,
+    nodeMajor >= 22,
+    "Install Node.js 22+ from https://nodejs.org"
+  );
+
+  // 2. Claude Desktop app directory
+  const claudeDir = path.dirname(CLAUDE_CONFIG);
+  check(
+    "Claude Desktop app directory found",
+    fs.existsSync(claudeDir),
+    "Install Claude Desktop from https://claude.ai/download"
+  );
+
+  // 3. Claude Desktop config exists and is valid JSON
+  let configParsed: ClaudeConfig | null = null;
+  if (fs.existsSync(CLAUDE_CONFIG)) {
+    try { configParsed = JSON.parse(fs.readFileSync(CLAUDE_CONFIG, "utf8")) as ClaudeConfig; }
+    catch { /* invalid JSON */ }
+  }
+  check(
+    "Claude Desktop config exists and is valid JSON",
+    configParsed !== null,
+    `Open Claude Desktop once if config is missing (${CLAUDE_CONFIG})`
+  );
+
+  // 4. At least one server is wrapped
+  if (configParsed) {
+    const servers = Object.entries(configParsed.mcpServers ?? {});
+    const wrapped = servers.filter(([, s]) => isWrapped(s));
+    check(
+      `SousMCP is wrapping ${wrapped.length} of ${servers.length} MCP server(s)`,
+      wrapped.length > 0 || servers.length === 0,
+      servers.length > 0 ? "Run 'sousmcp install' to wrap your servers" : "Add MCP servers to Claude Desktop, then run 'sousmcp install'"
+    );
+  }
+
+  // 5. SousMCP config directory
+  check(
+    "~/.sousmcp/ config directory exists",
+    fs.existsSync(SOUSMCP_DIR),
+    "Run 'sousmcp install' to initialise"
+  );
+
+  // 6. Database accessible + chain valid
+  const cfg = loadConfig();
+  let dbAccessible = false;
+  let chainOk = false;
+  if (fs.existsSync(cfg.dbPath)) {
+    try {
+      const store = new LogStore(cfg.dbPath);
+      chainOk = store.verifyChain();
+      store.close();
+      dbAccessible = true;
+    } catch { /* db inaccessible */ }
+  }
+  check(
+    "Database accessible",
+    dbAccessible,
+    "Run 'sousmcp install' to initialise the database"
+  );
+  if (dbAccessible) {
+    check(
+      "Merkle chain intact (no tampering detected)",
+      chainOk,
+      "Chain is broken — log may have been modified outside SousMCP"
+    );
+  }
+
+  // 7. Port available (or SousMCP already listening)
+  const apiRunning = await checkApiRunning(cfg.apiPort);
+  if (!apiRunning) {
+    const portFree = await new Promise<boolean>(resolve => {
+      const s = net.createServer();
+      s.once("error", () => resolve(false));
+      s.once("listening", () => { s.close(); resolve(true); });
+      s.listen(cfg.apiPort, "127.0.0.1");
+    });
+    check(
+      `Port ${cfg.apiPort} available for API server`,
+      portFree,
+      `Another process owns :${cfg.apiPort} — set "apiPort" in ~/.sousmcp/config.json`
+    );
+  } else {
+    check(`API server already running on port ${cfg.apiPort}`, true);
+  }
+
+  process.stdout.write("\n");
+  if (allOk) {
+    ok("All checks passed — SousMCP is ready.");
+  } else {
+    warn("Some checks failed — follow the Fix suggestions above.");
+  }
+  process.stdout.write("\n");
+}
+
 // ── Auto-update check ──────────────────────────────────────────────────────
 
 function checkForUpdate(): Promise<string | null> {
@@ -540,9 +672,10 @@ function printHelp(): void {
     `  ${chalk.cyan("uninstall")}                    Restore original Claude Desktop config\n` +
     `  ${chalk.cyan("start")}                        Start all configured MCP servers under proxy\n` +
     `  ${chalk.cyan("status")}                       Show installation and runtime status\n` +
+    `  ${chalk.cyan("doctor")}                       Run health checks and suggest fixes\n` +
     `  ${chalk.cyan("log")} [--session <id>] [--n N] Pretty-print recent messages\n` +
     `  ${chalk.cyan("digest")} [--out <file>]        Generate weekly activity digest\n` +
-    `  ${chalk.cyan("export")} --from --to --out     Export signed message bundle\n` +
+    `  ${chalk.cyan("export")} --from --to [--out]   Export signed message bundle\n` +
     `  ${chalk.cyan("verify")} <file>                Verify a signed export bundle\n` +
     `  ${chalk.cyan("policies")} [--strict|--learning] View / configure policies\n\n`
   );
@@ -559,6 +692,7 @@ const [cmd, ...rest] = process.argv.slice(2);
       case "uninstall": await cmdUninstall(); break;
       case "start":     await cmdStart(); break;
       case "status":    await cmdStatus(); break;
+      case "doctor":    await cmdDoctor(); break;
       case "log":       await cmdLog(rest); break;
       case "digest":    await cmdDigest(rest); break;
       case "export":    await cmdExport(rest); break;
