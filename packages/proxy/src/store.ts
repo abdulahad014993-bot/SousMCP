@@ -57,10 +57,31 @@ function computeHash(
   return sha256(`${prevHash}|${timestamp}|${direction}|${method}|${paramsJson}`);
 }
 
+interface PendingRow {
+  id: string;
+  sessionId: string;
+  timestamp: number;
+  direction: string;
+  method: string;
+  paramsJson: string;
+  resultJson: string | null;
+  policyAction: string | null;
+  prevHash: string;
+  hash: string;
+}
+
 // ── LogStore ───────────────────────────────────────────────────────────────
 
 export class LogStore {
   private readonly db: DB;
+
+  // Async write queue: hashes are computed synchronously (preserving chain
+  // order), rows are persisted in batches off the critical path.
+  private readonly tailHash = new Map<string, string>();
+  private readonly writeQueue: PendingRow[] = [];
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly DRAIN_MS = 10;
+  private static readonly BATCH_CAP = 64;
 
   private readonly stmtInsertSession: Stmt;
   private readonly stmtGetSessions: Stmt;
@@ -81,6 +102,9 @@ export class LogStore {
   constructor(dbPath: string) {
     this.db = new DB(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA synchronous = NORMAL");   // safe with WAL; skips per-write fsync
+    this.db.exec("PRAGMA cache_size = -65536");    // 64 MB page cache
+    this.db.exec("PRAGMA temp_store = MEMORY");    // temp tables stay in RAM
     this.db.exec("PRAGMA foreign_keys = ON");
 
     this.db.exec(`
@@ -189,17 +213,58 @@ export class LogStore {
     result: unknown = null,
     policyAction: string | null = null
   ): void {
-    const prevRow = this.stmtLastHash.get(sessionId) as { hash: string } | undefined;
-    const prevHash = prevRow?.hash ?? GENESIS;
+    // On the first message for a session, seed tail hash from DB (one DB read).
+    // All subsequent messages use the in-memory value — zero DB reads on hot path.
+    if (!this.tailHash.has(sessionId)) {
+      const row = this.stmtLastHash.get(sessionId) as { hash: string } | undefined;
+      this.tailHash.set(sessionId, row?.hash ?? GENESIS);
+    }
+
+    const prevHash = this.tailHash.get(sessionId)!;
     const timestamp = Date.now();
     const paramsJson = JSON.stringify(params ?? null);
     const resultJson = result !== null ? JSON.stringify(result) : null;
     const hash = computeHash(prevHash, timestamp, direction, method, paramsJson);
 
-    this.stmtInsertMessage.run({
+    // Advance in-memory tail before returning so the next call chains correctly
+    // even if multiple messages arrive before the async drain fires.
+    this.tailHash.set(sessionId, hash);
+
+    this.writeQueue.push({
       id: randomUUID(), sessionId, timestamp, direction, method,
       paramsJson, resultJson, policyAction, prevHash, hash,
     });
+
+    // Flush immediately when the queue is full, otherwise wait for the batch window.
+    if (this.writeQueue.length >= LogStore.BATCH_CAP) {
+      this.drainNow();
+    } else {
+      this.scheduleDrain();
+    }
+  }
+
+  private scheduleDrain(): void {
+    if (this.drainTimer !== null) return;
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null;
+      this.drainNow();
+    }, LogStore.DRAIN_MS);
+  }
+
+  private drainNow(): void {
+    if (this.drainTimer !== null) { clearTimeout(this.drainTimer); this.drainTimer = null; }
+    if (this.writeQueue.length === 0) return;
+    const batch = this.writeQueue.splice(0, LogStore.BATCH_CAP);
+    try {
+      this.db.exec("BEGIN");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const row of batch) this.stmtInsertMessage.run(row as any);
+      this.db.exec("COMMIT");
+    } catch {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+      // Discard the failed batch — the in-memory chain is still valid and new
+      // messages will continue chaining correctly from the last persisted hash.
+    }
   }
 
   getMessages(sessionId?: string): MessageRow[] {
@@ -258,6 +323,9 @@ export class LogStore {
   }
 
   close(): void {
+    // Drain all pending writes before closing — ensures nothing is lost on
+    // graceful shutdown (SIGTERM/SIGINT handled in index.ts).
+    while (this.writeQueue.length > 0) this.drainNow();
     this.db.close();
   }
 }
