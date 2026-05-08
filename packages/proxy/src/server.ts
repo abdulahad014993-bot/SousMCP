@@ -3,6 +3,7 @@ import cors from "cors";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import { log } from "./logger.js";
+import { metrics } from "./metrics.js";
 import type { LogStore } from "./store.js";
 import type { PolicyEngine } from "./policy.js";
 
@@ -15,7 +16,7 @@ function portInUse(port: number): Promise<boolean> {
   });
 }
 
-export function startApiServer(store: LogStore, policy: PolicyEngine, port = 8787): void {
+export function startApiServer(store: LogStore, policy: PolicyEngine, port = 8787, startTime = Date.now()): void {
   portInUse(port).then(inUse => {
     if (inUse) {
       log("warn", `API port ${port} already in use — skipping server`);
@@ -66,6 +67,29 @@ export function startApiServer(store: LogStore, policy: PolicyEngine, port = 878
     app.get("/api/stats", (_req, res) => {
       try { res.json(store.getStats()); }
       catch (err) { res.status(500).json({ error: String(err) }); }
+    });
+
+    app.get("/api/metrics", (_req, res) => {
+      res.json(metrics.snapshot());
+    });
+
+    app.get("/api/health", (_req, res) => {
+      try {
+        const snap = metrics.snapshot();
+        const sessions = store.getSessions();
+        const stats = store.getStats();
+        res.json({
+          status: "ok",
+          uptime: Math.round((Date.now() - startTime) / 1000),
+          messagesTotal: stats.totalMessages,
+          servers: sessions.map(s => ({
+            name: s.serverName,
+            sessionId: s.id,
+            startedAt: new Date(s.startedAt).toISOString(),
+            messageCount: snap.messages.total,
+          })),
+        });
+      } catch (err) { res.status(500).json({ error: String(err) }); }
     });
 
     app.listen(port, "127.0.0.1", () => {

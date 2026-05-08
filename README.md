@@ -2,7 +2,7 @@
 
 > A sousveillant transparency layer for MCP agents
 
-[![CI](https://github.com/abdulahad014993-bot-bot/SousMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/abdulahad014993-bot-bot/SousMCP/actions/workflows/ci.yml)
+[![CI](https://github.com/abdulahad014993-bot/SousMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/abdulahad014993-bot/SousMCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue)](https://www.typescriptlang.org)
@@ -73,31 +73,49 @@ packages/
 
 ---
 
+## How it works
+
+1. **Install once** — `sousmcp install` reads your Claude Desktop config and wraps every MCP server with the proxy. You don't change anything else; Claude and your servers are unmodified.
+2. **Forget about it** — the proxy runs silently in the background. Every tool call is logged to a tamper-evident SQLite database with a cryptographic chain you can verify later.
+3. **Get notified when it matters** — risky actions (deleting files, sending emails, running destructive shell commands) pause and prompt you for approve/deny. Less critical actions show a macOS notification in learning mode so you can see what your agents actually do before locking anything down.
+
+---
+
 ## Quick Start
 
 **Requirements:** Node.js ≥ 22.0.0, npm ≥ 9
 
 ```bash
-git clone https://github.com/abdulahad014993-bot-bot/SousMCP.git
-cd SousMCP
-npm install
-npm run build
+# 1. Install globally
+npm install -g @sousmcp/proxy
+
+# 2. Wrap your Claude Desktop MCP servers (one command, done)
+sousmcp install
+
+# 3. Restart Claude Desktop, then check everything is running
+sousmcp status
 ```
 
-**Wrap any MCP server:**
+That's it. All your MCP traffic is now logged and policy-checked.
+
+**Try it without Claude Desktop** (development / testing):
 
 ```bash
-node packages/proxy/dist/index.js <mcp-server-command> [args...]
+# Start all configured servers under the proxy
+sousmcp start
 
-# Example — wrap a Python MCP server:
+# Or wrap a single server manually
 node packages/proxy/dist/index.js python3 my_mcp_server.py
 ```
 
-The proxy:
-- Starts an API server at `http://localhost:8787`
-- Writes logs to `./sousmcp.db` (override with `SOUSMCP_DB=/path/to/db`)
-- Loads policies from `~/.sousmcp/policies.yaml` (written on first run)
-- On exit, prints the last 10 intercepted messages with chain integrity status
+**Useful follow-up commands:**
+
+```bash
+sousmcp log           # see recent intercepted tool calls
+sousmcp policies      # view active rules
+sousmcp digest        # weekly activity summary
+sousmcp status        # installation + runtime status + update check
+```
 
 ---
 
@@ -146,9 +164,11 @@ curl -X POST http://localhost:8787/api/policies/reload
 | `/api/messages?sessionId=X` | GET | Messages for a session (or all) |
 | `/api/policies` | GET | Current rules + policy file path |
 | `/api/policies` | POST | Replace rules (`{ rules: [...] }`) |
-| `/api/policies/reload` | POST | Reload from disk |
+| `/api/policies/reload` | POST | Reload from disk (also triggered by file change) |
 | `/api/policies/raw` | GET | Raw YAML file content |
 | `/api/stats` | GET | Message counts by method, sessions today, policies triggered |
+| `/api/metrics` | GET | In-process counters: throughput, latency, rule hits, errors |
+| `/api/health` | GET | Status, uptime, and per-server connection info |
 
 ---
 

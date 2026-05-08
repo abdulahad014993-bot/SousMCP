@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// SousMCP CLI — install / uninstall / status / log / digest / export / verify
+// SousMCP CLI — install / uninstall / start / status / log / digest / export / verify
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
+import * as https from "node:https";
+import { spawn } from "node:child_process";
 import chalk from "chalk";
 import { LogStore } from "./store.js";
 import { PolicyEngine } from "./policy.js";
@@ -283,6 +285,15 @@ async function cmdStatus(): Promise<void> {
     ? chalk.green(`running at http://127.0.0.1:${cfg.apiPort}`)
     : chalk.dim(`not running (starts automatically with proxy)`);
   process.stdout.write(chalk.bold("API server:    ") + apiStatus + "\n\n");
+
+  // Update check (non-blocking — skip if offline)
+  const newer = await checkForUpdate();
+  if (newer) {
+    process.stdout.write(
+      chalk.yellow(`Update available: v${newer}\n`) +
+      `  Run: ${chalk.cyan("npm install -g @sousmcp/proxy")}\n\n`
+    );
+  }
 }
 
 // ── sousmcp log ────────────────────────────────────────────────────────────
@@ -423,6 +434,102 @@ async function cmdPolicies(args: string[]): Promise<void> {
   } catch (e) { err(`Could not load policies: ${String(e)}`); }
 }
 
+// ── sousmcp start ──────────────────────────────────────────────────────────
+
+async function cmdStart(): Promise<void> {
+  if (!fs.existsSync(CLAUDE_CONFIG)) {
+    err("Claude Desktop config not found. Run 'sousmcp install' first.");
+    return;
+  }
+
+  const cfg = loadConfig();
+  fs.mkdirSync(SOUSMCP_DIR, { recursive: true });
+
+  const claudeCfg = JSON.parse(fs.readFileSync(CLAUDE_CONFIG, "utf8")) as ClaudeConfig;
+  const servers = Object.entries(claudeCfg.mcpServers ?? {});
+
+  if (servers.length === 0) {
+    warn("No MCP servers configured. Run 'sousmcp install' first.");
+    return;
+  }
+
+  heading("SousMCP Multi-Server Start");
+
+  const children: ReturnType<typeof spawn>[] = [];
+
+  for (const [name, server] of servers) {
+    // Extract original command — unwrap if already wrapped by SousMCP.
+    let origCmd: string;
+    let origArgs: string[];
+    if (isWrapped(server)) {
+      const idx = server.args!.findIndex(a => a.includes("dist/index.js"));
+      const tail = server.args!.slice(idx + 1);
+      origCmd = tail[0] ?? server.command;
+      origArgs = tail.slice(1);
+    } else {
+      origCmd = server.command;
+      origArgs = server.args ?? [];
+    }
+
+    const child = spawn(
+      NODE_BIN,
+      [PROXY_SCRIPT, origCmd, ...origArgs],
+      {
+        env: { ...process.env, SOUSMCP_DB: cfg.dbPath },
+        stdio: ["pipe", "pipe", "pipe"],
+      }
+    );
+
+    child.on("exit", code => {
+      warn(`${name} exited (code ${code ?? "?"})`);
+    });
+
+    children.push(child);
+    ok(`${name}: ${origCmd} ${origArgs.join(" ")}`);
+  }
+
+  ok(`${children.length} server(s) started. API → http://127.0.0.1:${cfg.apiPort}`);
+  info("Press Ctrl+C to stop all.");
+
+  const stopAll = () => {
+    for (const c of children) { try { c.kill("SIGTERM"); } catch { /* ignore */ } }
+    process.exit(0);
+  };
+  process.on("SIGINT", stopAll);
+  process.on("SIGTERM", stopAll);
+
+  await new Promise<never>(() => { /* block until signal */ });
+}
+
+// ── Auto-update check ──────────────────────────────────────────────────────
+
+function checkForUpdate(): Promise<string | null> {
+  return new Promise(resolve => {
+    const req = https.get(
+      "https://registry.npmjs.org/@sousmcp/proxy/latest",
+      { headers: { "User-Agent": "sousmcp-cli" }, timeout: 3000 },
+      res => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { version?: string };
+            const latest = json.version ?? null;
+            // Read current version from own package.json
+            const pkgPath = path.resolve(path.dirname(process.argv[1] ?? ""), "..", "package.json");
+            const current = fs.existsSync(pkgPath)
+              ? (JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version?: string }).version ?? null
+              : null;
+            resolve(latest && current && latest !== current ? latest : null);
+          } catch { resolve(null); }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+  });
+}
+
 // ── Help ───────────────────────────────────────────────────────────────────
 
 function printHelp(): void {
@@ -431,6 +538,7 @@ function printHelp(): void {
     `${chalk.bold("Commands:")}\n` +
     `  ${chalk.cyan("install")}                      Wrap Claude Desktop MCP servers\n` +
     `  ${chalk.cyan("uninstall")}                    Restore original Claude Desktop config\n` +
+    `  ${chalk.cyan("start")}                        Start all configured MCP servers under proxy\n` +
     `  ${chalk.cyan("status")}                       Show installation and runtime status\n` +
     `  ${chalk.cyan("log")} [--session <id>] [--n N] Pretty-print recent messages\n` +
     `  ${chalk.cyan("digest")} [--out <file>]        Generate weekly activity digest\n` +
@@ -449,6 +557,7 @@ const [cmd, ...rest] = process.argv.slice(2);
     switch (cmd) {
       case "install":   await cmdInstall(); break;
       case "uninstall": await cmdUninstall(); break;
+      case "start":     await cmdStart(); break;
       case "status":    await cmdStatus(); break;
       case "log":       await cmdLog(rest); break;
       case "digest":    await cmdDigest(rest); break;

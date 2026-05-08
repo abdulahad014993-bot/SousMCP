@@ -9,7 +9,9 @@ import { pauseForApproval, notifyLearningMode } from "./notify.js";
 import { startApiServer } from "./server.js";
 import { loadConfig, isLearningMode, SOUSMCP_DIR } from "./config.js";
 import { log, logError, setLogFile } from "./logger.js";
+import { metrics } from "./metrics.js";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { InterceptedMessage, InboundResult } from "@sousmcp/shared";
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -36,8 +38,22 @@ const sessionId = store.createSession("host", targetCommand, serverCommand);
 
 log("info", `Proxy starting — target: ${serverCommand} session: ${sessionId} learning: ${learningMode}`);
 
-try { startApiServer(store, policy, cfg.apiPort); } catch (err) {
+const proxyStartTime = Date.now();
+try { startApiServer(store, policy, cfg.apiPort, proxyStartTime); } catch (err) {
   log("warn", `API server failed to start: ${String(err)}`);
+}
+
+// Hot-reload policies when the file changes on disk.
+const policiesPath = path.join(SOUSMCP_DIR, "policies.yaml");
+try {
+  fs.watch(policiesPath, { persistent: false }, eventType => {
+    if (eventType === "change") {
+      policy.reload();
+      log("info", `Policies reloaded: ${policy.getRules().length} rules`);
+    }
+  });
+} catch (err) {
+  log("warn", `Could not watch policies file: ${String(err)}`);
 }
 
 // ── JSON-RPC helpers ───────────────────────────────────────────────────────
@@ -74,15 +90,19 @@ function jsonRpcError(id: unknown, message: string): string {
 // ── Inbound handler ────────────────────────────────────────────────────────
 
 async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
+  const t0 = Date.now();
   const method = extractMethod(msg.parsed);
   const params = extractParams(msg.parsed);
   const id = extractId(msg.parsed);
+
+  metrics.recordMessage("inbound");
 
   let evalResult;
   try {
     evalResult = policy.evaluate(msg.parsed);
   } catch (err) {
     logError(err, "Policy evaluation");
+    metrics.recordError();
     evalResult = { action: "log" as const, learningModeOverride: false };
   }
 
@@ -96,6 +116,7 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
   if (action === "block") {
     const ruleName = rule?.name ?? "policy";
     log("info", `BLOCK ${ruleName}: ${method}`);
+    metrics.recordPolicyAction(ruleName, "block", Date.now() - t0);
     try { store.logMessage(sessionId, msg.direction, method, params, null, "block"); } catch (err) {
       logError(err, "DB write (block)");
     }
@@ -108,6 +129,7 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
       logError(err, "Pause approval — defaulting to approve");
     }
     const policyAction = decision === "deny" ? "pause:denied" : "pause:approved";
+    metrics.recordPolicyAction(rule?.name, policyAction, Date.now() - t0);
     try { store.logMessage(sessionId, msg.direction, method, params, null, policyAction); } catch (err) {
       logError(err, "DB write (pause)");
     }
@@ -119,6 +141,7 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
 
   // log / learning-mode-override — forward and record
   const policyAction = learningModeOverride ? `learning:${rule?.action ?? "log"}` : (rule ? "log" : null);
+  metrics.recordPolicyAction(rule?.name, policyAction ?? "log", Date.now() - t0);
   try { store.logMessage(sessionId, msg.direction, method, params, null, policyAction); } catch (err) {
     logError(err, "DB write");
   }
@@ -128,6 +151,7 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
 // ── Outbound handler ───────────────────────────────────────────────────────
 
 function onOutbound(msg: InterceptedMessage): void {
+  metrics.recordMessage("outbound");
   const method = extractMethod(msg.parsed);
   const params = extractParams(msg.parsed);
   try { store.logMessage(sessionId, msg.direction, method, params); } catch (err) {
