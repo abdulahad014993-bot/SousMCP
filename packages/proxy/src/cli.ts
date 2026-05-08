@@ -25,6 +25,84 @@ const CLAUDE_CONFIG = path.join(
 );
 const CLAUDE_BACKUP = CLAUDE_CONFIG + ".sousmcp.bak";
 
+// Cursor stores its global MCP config here (same format as Claude Desktop).
+const CURSOR_CONFIG = path.join(os.homedir(), ".cursor", "mcp.json");
+const CURSOR_BACKUP = CURSOR_CONFIG + ".sousmcp.bak";
+
+interface ConfigTarget {
+  configPath: string;
+  backupPath: string;
+  clientName: string;
+  restartMsg: string;
+}
+
+function resolveTarget(flags: Record<string, string>): ConfigTarget {
+  if (flags["config"]) {
+    const p = path.resolve(flags["config"]);
+    return { configPath: p, backupPath: p + ".sousmcp.bak", clientName: path.basename(p), restartMsg: "" };
+  }
+  if (flags["cursor"] === "true") {
+    return { configPath: CURSOR_CONFIG, backupPath: CURSOR_BACKUP, clientName: "Cursor", restartMsg: "Restart Cursor to apply changes." };
+  }
+  return { configPath: CLAUDE_CONFIG, backupPath: CLAUDE_BACKUP, clientName: "Claude Desktop", restartMsg: "Restart Claude Desktop, then:" };
+}
+
+function printDryRunDiff(
+  toWrap: string[],
+  before: Record<string, MCPServer>,
+  after: Record<string, MCPServer>
+): void {
+  process.stdout.write(chalk.bold.yellow("\nDry run — no changes applied.\n\n"));
+  if (toWrap.length === 0) {
+    process.stdout.write(chalk.dim("  No changes would be made.\n\n"));
+    return;
+  }
+  process.stdout.write(`Would wrap ${toWrap.length} server${toWrap.length > 1 ? "s" : ""}: ` +
+    chalk.cyan(toWrap.join(", ")) + "\n\n");
+  for (const name of toWrap) {
+    const b = before[name];
+    const a = after[name];
+    process.stdout.write(chalk.bold(`  ${name}:\n`));
+    process.stdout.write(chalk.red(`  - command: ${b.command}\n`));
+    if ((b.args ?? []).length) process.stdout.write(chalk.red(`  - args:    ${JSON.stringify(b.args)}\n`));
+    process.stdout.write(chalk.green(`  + command: ${a.command}\n`));
+    process.stdout.write(chalk.green(`  + args:    ${JSON.stringify(a.args)}\n`));
+    process.stdout.write("\n");
+  }
+}
+
+function printMissingClientMessage(): void {
+  process.stdout.write(
+    chalk.yellow("\nClaude Desktop not found.") +
+    " SousMCP also works with Cursor and any MCP client.\n\n" +
+    chalk.bold("Options:\n") +
+    `  ${chalk.cyan("sousmcp install --cursor")}           Wrap Cursor MCP servers\n` +
+    `  ${chalk.cyan("sousmcp install --config <path>")}    Wrap servers in any JSON config file\n\n` +
+    chalk.bold("Manual setup:\n") +
+    "  Wrap your MCP server command like this:\n\n" +
+    chalk.red(`  before: { "command": "python3", "args": ["server.py"] }\n`) +
+    chalk.green(`  after:  { "command": "${NODE_BIN}",\n`) +
+    chalk.green(`            "args": ["${PROXY_SCRIPT}", "python3", "server.py"] }\n\n`)
+  );
+
+  fs.mkdirSync(SOUSMCP_DIR, { recursive: true });
+  const templatePath = path.join(SOUSMCP_DIR, "client-config.json");
+  if (!fs.existsSync(templatePath)) {
+    const template = {
+      _instructions: "Wrap your MCP servers using this pattern, then paste into your MCP client config.",
+      mcpServers: {
+        "your-server-name": {
+          command: NODE_BIN,
+          args: [PROXY_SCRIPT, "<your-server-command>", "<args...>"],
+          env: { SOUSMCP_DB: path.join(SOUSMCP_DIR, "sousmcp.db") },
+        },
+      },
+    };
+    fs.writeFileSync(templatePath, JSON.stringify(template, null, 2), "utf8");
+    ok(`Created setup template at ${templatePath}`);
+  }
+}
+
 // The proxy daemon is always in dist/index.js alongside the compiled CLI.
 // __dirname is the dist/ dir in CommonJS output, regardless of how the CLI
 // was invoked (directly or through the bin/ wrapper).
@@ -104,48 +182,47 @@ function openStore(): LogStore {
 
 // ── sousmcp install ────────────────────────────────────────────────────────
 
-async function cmdInstall(): Promise<void> {
+async function cmdInstall(args: string[]): Promise<void> {
+  const { flags } = parseArgs(args);
+  const dryRun = flags["dry-run"] === "true";
+  const { configPath, backupPath, clientName, restartMsg } = resolveTarget(flags);
+
   const firstRun = !fs.existsSync(SOUSMCP_DIR);
 
-  // ── First-run onboarding ─────────────────────────────────────────────────
-  if (firstRun) {
-    process.stdout.write(chalk.bold.cyan("\nWelcome to SousMCP\n") +
-      "─".repeat(48) + "\n" +
-      "SousMCP sits between Claude and your MCP servers, logging\n" +
-      "every tool call to a tamper-evident database. You can review\n" +
-      "what your AI did, set policies to block or pause risky actions,\n" +
-      "and get weekly digests of AI activity.\n\n"
-    );
+  if (!dryRun) {
+    if (firstRun) {
+      process.stdout.write(chalk.bold.cyan("\nWelcome to SousMCP\n") +
+        "─".repeat(48) + "\n" +
+        "SousMCP sits between Claude and your MCP servers, logging\n" +
+        "every tool call to a tamper-evident database.\n\n"
+      );
+    }
+
+    fs.mkdirSync(SOUSMCP_DIR, { recursive: true });
+    let cfg = loadConfig();
+    if (firstRun || !fs.existsSync(CONFIG_FILE)) {
+      cfg.learningModeStarted = Date.now();
+      cfg.learningMode = true;
+      saveConfig(cfg);
+    }
+    const store = new LogStore(cfg.dbPath);
+    store.close();
+    new PolicyEngine();
+    if (firstRun) {
+      ok("Created ~/.sousmcp/"); ok("Initialized database"); ok("Written default policies");
+    }
   }
 
-  // Initialise config directory and database
-  fs.mkdirSync(SOUSMCP_DIR, { recursive: true });
-
-  let cfg = loadConfig();
-  if (firstRun || !fs.existsSync(CONFIG_FILE)) {
-    cfg.learningModeStarted = Date.now();
-    cfg.learningMode = true;
-    saveConfig(cfg);
-  }
-
-  // Initialise database
-  const store = new LogStore(cfg.dbPath);
-  store.close();
-
-  // Initialise default policies
-  new PolicyEngine(); // writes ~/.sousmcp/policies.yaml if absent
-
-  if (firstRun) {
-    ok("Created ~/.sousmcp/");
-    ok("Initialized database");
-    ok("Written default policies");
-  }
-
-  // ── Wrap Claude Desktop config ───────────────────────────────────────────
-  if (!fs.existsSync(CLAUDE_CONFIG)) {
-    warn("Claude Desktop config not found at:");
-    info(CLAUDE_CONFIG);
-    info("Start Claude Desktop at least once, then re-run 'sousmcp install'.");
+  // ── Resolve config file ──────────────────────────────────────────────────
+  if (!fs.existsSync(configPath)) {
+    if (flags["cursor"] === "true") {
+      warn(`Cursor MCP config not found at ${configPath}`);
+      info("Open Cursor, add an MCP server in settings, then re-run 'sousmcp install --cursor'.");
+    } else if (flags["config"]) {
+      err(`Config file not found: ${configPath}`);
+    } else {
+      printMissingClientMessage();
+    }
     return;
   }
 
@@ -155,80 +232,115 @@ async function cmdInstall(): Promise<void> {
     return;
   }
 
-  const raw = fs.readFileSync(CLAUDE_CONFIG, "utf8");
-  const claudeCfg = JSON.parse(raw) as ClaudeConfig;
+  let raw: string;
+  let claudeCfg: ClaudeConfig;
+  try {
+    raw = fs.readFileSync(configPath, "utf8");
+    claudeCfg = JSON.parse(raw) as ClaudeConfig;
+  } catch (e) {
+    err(`Cannot read ${configPath}: ${String(e)}`);
+    return;
+  }
+
+  const cfg = loadConfig();
   const servers = claudeCfg.mcpServers ?? {};
 
-  // Back up original
-  if (!fs.existsSync(CLAUDE_BACKUP)) {
-    fs.writeFileSync(CLAUDE_BACKUP, raw, "utf8");
-    ok("Backed up original config to " + path.basename(CLAUDE_BACKUP));
-  }
-
-  cfg = loadConfig(); // reload after potential firstRun save
-  let wrapped = 0;
-  const wrappedNames: string[] = [];
+  // ── Compute what would change ────────────────────────────────────────────
+  const toWrap: string[] = [];
   const alreadyWrapped: string[] = [];
+  const afterServers: Record<string, MCPServer> = JSON.parse(JSON.stringify(servers));
 
-  for (const [name, server] of Object.entries(servers)) {
-    if (isWrapped(server)) {
-      alreadyWrapped.push(name);
-      continue;
-    }
-    const originalArgs = server.args ?? [];
-    server.args = [PROXY_SCRIPT, server.command, ...originalArgs];
+  for (const [name, server] of Object.entries(afterServers)) {
+    if (isWrapped(server)) { alreadyWrapped.push(name); continue; }
+    server.args = [PROXY_SCRIPT, server.command, ...(server.args ?? [])];
     server.command = NODE_BIN;
     server.env = { ...(server.env ?? {}), SOUSMCP_DB: cfg.dbPath };
-    wrapped++;
-    wrappedNames.push(name);
+    toWrap.push(name);
   }
 
-  claudeCfg.mcpServers = servers;
-  fs.writeFileSync(CLAUDE_CONFIG, JSON.stringify(claudeCfg, null, 2), "utf8");
-
-  if (alreadyWrapped.length > 0) {
-    info(`Already wrapped: ${alreadyWrapped.join(", ")}`);
+  // ── Dry-run: show diff and exit without writing ──────────────────────────
+  if (dryRun) {
+    printDryRunDiff(toWrap, servers, afterServers);
+    return;
   }
-  if (wrapped > 0) {
-    ok(`Wrapped ${wrapped} MCP server${wrapped > 1 ? "s" : ""}: ${wrappedNames.join(", ")}`);
+
+  // ── Apply ────────────────────────────────────────────────────────────────
+  if (!fs.existsSync(backupPath)) {
+    fs.writeFileSync(backupPath, raw, "utf8");
+    ok(`Backed up original ${clientName} config`);
+  }
+
+  claudeCfg.mcpServers = afterServers;
+  fs.writeFileSync(configPath, JSON.stringify(claudeCfg, null, 2), "utf8");
+
+  if (alreadyWrapped.length > 0) info(`Already wrapped: ${alreadyWrapped.join(", ")}`);
+  if (toWrap.length > 0) {
+    ok(`Wrapped ${toWrap.length} MCP server${toWrap.length > 1 ? "s" : ""}: ${toWrap.join(", ")}`);
   } else {
     info("All servers were already wrapped — nothing changed.");
   }
 
-  // ── Post-install message ─────────────────────────────────────────────────
   process.stdout.write("\n");
   if (firstRun) {
-    const days = Math.ceil(cfg.learningModeDays);
     process.stdout.write(
-      chalk.bold.yellow(`Learning mode enabled for ${days} days`) +
-      " — SousMCP will log and notify\n" +
-      "but won't block anything yet, so you can see what your agents\n" +
-      "actually do before writing rules.\n\n" +
-      `Run ${chalk.cyan("'sousmcp policies --strict'")} to enable blocking immediately.\n\n`
+      chalk.bold.yellow(`Learning mode enabled for ${cfg.learningModeDays} days`) +
+      " — will log and notify but won't block yet.\n\n" +
+      `Run ${chalk.cyan("'sousmcp policies --strict'")} to enforce immediately.\n\n`
     );
   }
-  process.stdout.write(
-    `Restart Claude Desktop, then:\n` +
-    `  ${chalk.cyan("sousmcp status")}   — check everything is running\n` +
-    `  ${chalk.cyan("sousmcp log")}      — see what's been intercepted\n\n`
-  );
+  if (restartMsg) {
+    process.stdout.write(
+      `${restartMsg}\n` +
+      `  ${chalk.cyan("sousmcp status")}   — check everything is running\n` +
+      `  ${chalk.cyan("sousmcp log")}      — see what's been intercepted\n\n`
+    );
+  }
 }
 
 // ── sousmcp uninstall ──────────────────────────────────────────────────────
 
-async function cmdUninstall(): Promise<void> {
-  if (!fs.existsSync(CLAUDE_BACKUP)) {
-    err("No backup found at " + CLAUDE_BACKUP);
+async function cmdUninstall(args: string[]): Promise<void> {
+  const { flags } = parseArgs(args);
+  const { configPath, backupPath, clientName, restartMsg } = resolveTarget(flags);
+
+  if (fs.existsSync(backupPath)) {
+    // Happy path: restore from backup created at install time.
+    const backup = fs.readFileSync(backupPath, "utf8");
+    fs.writeFileSync(configPath, backup, "utf8");
+    fs.unlinkSync(backupPath);
+    ok(`Restored original ${clientName} config from backup`);
+  } else if (fs.existsSync(configPath)) {
+    // No backup — unwrap wrapped servers in place.
+    try {
+      const claudeCfg = JSON.parse(fs.readFileSync(configPath, "utf8")) as ClaudeConfig;
+      const servers = claudeCfg.mcpServers ?? {};
+      let unwrapped = 0;
+      for (const [, server] of Object.entries(servers)) {
+        if (!isWrapped(server)) continue;
+        const idx = server.args!.findIndex(a => a.includes("dist/index.js"));
+        if (idx === -1) continue;
+        const origCmd = server.args![idx + 1];
+        const origArgs = server.args!.slice(idx + 2);
+        server.command = origCmd;
+        server.args = origArgs.length > 0 ? origArgs : undefined;
+        if (server.env) {
+          delete server.env["SOUSMCP_DB"];
+          if (Object.keys(server.env).length === 0) delete server.env;
+        }
+        unwrapped++;
+      }
+      fs.writeFileSync(configPath, JSON.stringify(claudeCfg, null, 2), "utf8");
+      ok(`Unwrapped ${unwrapped} server${unwrapped !== 1 ? "s" : ""} from ${clientName} config`);
+    } catch (e) {
+      err(`Could not unwrap config: ${String(e)}`); return;
+    }
+  } else {
+    err(`Config not found: ${configPath}`);
     info("Was SousMCP ever installed?");
     return;
   }
 
-  const backup = fs.readFileSync(CLAUDE_BACKUP, "utf8");
-  fs.writeFileSync(CLAUDE_CONFIG, backup, "utf8");
-  fs.unlinkSync(CLAUDE_BACKUP);
-
-  ok("Restored original Claude Desktop config");
-  info("Restart Claude Desktop to complete uninstall.");
+  if (restartMsg) info(restartMsg);
   info("Your log database and policies remain at ~/.sousmcp/ for reference.");
 }
 
@@ -374,7 +486,7 @@ async function cmdExport(args: string[]): Promise<void> {
   try { from = parseDate(flags["from"]); to = parseDate(flags["to"]); }
   catch (e) { err(String(e)); return; }
 
-  to.setHours(23, 59, 59, 999);
+  to.setUTCHours(23, 59, 59, 999);
 
   const outFile = flags["out"] || "report.json";
 
@@ -668,8 +780,8 @@ function printHelp(): void {
   process.stdout.write(
     `\n${chalk.bold.cyan("SousMCP")} — a transparency layer for MCP agents\n\n` +
     `${chalk.bold("Commands:")}\n` +
-    `  ${chalk.cyan("install")}                      Wrap Claude Desktop MCP servers\n` +
-    `  ${chalk.cyan("uninstall")}                    Restore original Claude Desktop config\n` +
+    `  ${chalk.cyan("install")} [--cursor] [--config <path>] [--dry-run]  Wrap MCP servers\n` +
+    `  ${chalk.cyan("uninstall")} [--cursor] [--config <path>]           Restore config\n` +
     `  ${chalk.cyan("start")}                        Start all configured MCP servers under proxy\n` +
     `  ${chalk.cyan("status")}                       Show installation and runtime status\n` +
     `  ${chalk.cyan("doctor")}                       Run health checks and suggest fixes\n` +
@@ -688,8 +800,8 @@ const [cmd, ...rest] = process.argv.slice(2);
 (async () => {
   try {
     switch (cmd) {
-      case "install":   await cmdInstall(); break;
-      case "uninstall": await cmdUninstall(); break;
+      case "install":   await cmdInstall(rest); break;
+      case "uninstall": await cmdUninstall(rest); break;
       case "start":     await cmdStart(); break;
       case "status":    await cmdStatus(); break;
       case "doctor":    await cmdDoctor(); break;

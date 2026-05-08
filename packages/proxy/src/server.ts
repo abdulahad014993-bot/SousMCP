@@ -92,9 +92,11 @@ export function startApiServer(store: LogStore, policy: PolicyEngine, port = 878
       } catch (err) { res.status(500).json({ error: String(err) }); }
     });
 
+    // unref() so the HTTP server doesn't prevent natural process exit when
+    // the MCP child closes (stdin EOF → child exits → no other active handles).
     app.listen(port, "127.0.0.1", () => {
       log("info", `API server listening on http://127.0.0.1:${port}`);
-    }).on("error", (err: Error) => {
+    }).unref().on("error", (err: Error) => {
       log("warn", `API server error: ${err.message}`);
     });
   }).catch((err: unknown) => {

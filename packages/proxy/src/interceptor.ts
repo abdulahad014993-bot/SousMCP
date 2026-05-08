@@ -97,6 +97,11 @@ function pipeInbound(
     const trimmed = buffer.trimEnd();
     if (trimmed) enqueue(trimmed);
     buffer = "";
+    // Forward EOF to the MCP server after the queue drains — if the host
+    // closes its connection the server should also be told to stop.
+    queue.then(() => {
+      try { childStdin.end(); } catch { /* ignore */ }
+    }).catch(() => { /* ignore */ });
   });
 }
 
