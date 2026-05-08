@@ -20,14 +20,39 @@ import {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-const CLAUDE_CONFIG = path.join(
-  os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json"
-);
-const CLAUDE_BACKUP = CLAUDE_CONFIG + ".sousmcp.bak";
+const HOME = os.homedir();
 
-// Cursor stores its global MCP config here (same format as Claude Desktop).
-const CURSOR_CONFIG = path.join(os.homedir(), ".cursor", "mcp.json");
-const CURSOR_BACKUP = CURSOR_CONFIG + ".sousmcp.bak";
+// All known MCP clients, in detection priority order.
+interface KnownClient extends ConfigTarget {
+  id: string;
+}
+
+const KNOWN_CLIENTS: KnownClient[] = [
+  {
+    id: "claude-desktop",
+    clientName: "Claude Desktop",
+    configPath: path.join(HOME, "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+    backupPath: path.join(HOME, "Library", "Application Support", "Claude", "claude_desktop_config.json.sousmcp.bak"),
+    restartMsg: "Restart Claude Desktop to apply changes.",
+  },
+  {
+    id: "cursor",
+    clientName: "Cursor",
+    configPath: path.join(HOME, ".cursor", "mcp.json"),
+    backupPath: path.join(HOME, ".cursor", "mcp.json.sousmcp.bak"),
+    restartMsg: "Restart Cursor to apply changes.",
+  },
+  {
+    id: "claude-code",
+    clientName: "Claude Code",
+    configPath: path.join(HOME, ".claude.json"),
+    backupPath: path.join(HOME, ".claude.json.sousmcp.bak"),
+    restartMsg: "Restart Claude Code to apply changes.",
+  },
+];
+
+// Keep a reference to the first client for legacy paths that assumed Claude Desktop.
+const CLAUDE_CONFIG = KNOWN_CLIENTS[0].configPath;
 
 interface ConfigTarget {
   configPath: string;
@@ -36,15 +61,37 @@ interface ConfigTarget {
   restartMsg: string;
 }
 
-function resolveTarget(flags: Record<string, string>): ConfigTarget {
+// Returns explicit target(s) from flags, or empty array for auto-detect mode.
+function resolveTargets(flags: Record<string, string>): ConfigTarget[] {
   if (flags["config"]) {
     const p = path.resolve(flags["config"]);
-    return { configPath: p, backupPath: p + ".sousmcp.bak", clientName: path.basename(p), restartMsg: "" };
+    return [{ configPath: p, backupPath: p + ".sousmcp.bak", clientName: path.basename(p), restartMsg: "" }];
   }
-  if (flags["cursor"] === "true") {
-    return { configPath: CURSOR_CONFIG, backupPath: CURSOR_BACKUP, clientName: "Cursor", restartMsg: "Restart Cursor to apply changes." };
+  if (flags["client"]) {
+    const c = KNOWN_CLIENTS.find(k => k.id === flags["client"]);
+    if (!c) {
+      err(`Unknown client: ${flags["client"]}. Known: ${KNOWN_CLIENTS.map(k => k.id).join(", ")}`);
+      return [];
+    }
+    return [c];
   }
-  return { configPath: CLAUDE_CONFIG, backupPath: CLAUDE_BACKUP, clientName: "Claude Desktop", restartMsg: "Restart Claude Desktop, then:" };
+  // Legacy flags kept for backwards compatibility.
+  if (flags["cursor"] === "true") return [KNOWN_CLIENTS.find(k => k.id === "cursor")!];
+  return []; // auto-detect
+}
+
+// Scans for installed clients and returns those with a valid config file.
+function detectInstalledClients(): Array<{ client: KnownClient; servers: Record<string, MCPServer> }> {
+  const found: Array<{ client: KnownClient; servers: Record<string, MCPServer> }> = [];
+  for (const client of KNOWN_CLIENTS) {
+    if (!fs.existsSync(client.configPath)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(client.configPath, "utf8")) as ClaudeConfig;
+      const servers = parsed.mcpServers ?? {};
+      found.push({ client, servers });
+    } catch { /* skip invalid configs */ }
+  }
+  return found;
 }
 
 function printDryRunDiff(
@@ -180,15 +227,91 @@ function openStore(): LogStore {
   return new LogStore(cfg.dbPath);
 }
 
+// ── sousmcp install helpers ────────────────────────────────────────────────
+
+async function promptYN(question: string, defaultY = true): Promise<boolean> {
+  if (!process.stdin.isTTY) return defaultY;
+  process.stdout.write(question);
+  return new Promise(resolve => {
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    process.stdin.once("data", (data: unknown) => {
+      process.stdin.pause();
+      const s = String(data).trim().toLowerCase();
+      resolve(s === "" ? defaultY : s.startsWith("y"));
+    });
+  });
+}
+
+async function wrapOneTarget(target: ConfigTarget, dryRun: boolean): Promise<void> {
+  const { configPath, backupPath, clientName, restartMsg } = target;
+
+  if (!fs.existsSync(configPath)) {
+    const known = KNOWN_CLIENTS.find(k => k.configPath === configPath);
+    if (known?.id === "cursor") {
+      warn(`Cursor MCP config not found at ${configPath}`);
+      info("Open Cursor → Settings → MCP, add a server, then re-run.");
+    } else if (known?.id === "claude-code") {
+      warn(`Claude Code MCP config not found at ${configPath}`);
+      info("Run 'claude mcp add --global <name> <command>' first.");
+    } else {
+      err(`Config file not found: ${configPath}`);
+    }
+    return;
+  }
+
+  let raw: string;
+  let claudeCfg: ClaudeConfig;
+  try {
+    raw = fs.readFileSync(configPath, "utf8");
+    claudeCfg = JSON.parse(raw) as ClaudeConfig;
+  } catch (e) { err(`Cannot read ${configPath}: ${String(e)}`); return; }
+
+  const cfg = loadConfig();
+  const servers = claudeCfg.mcpServers ?? {};
+  const toWrap: string[] = [];
+  const alreadyWrapped: string[] = [];
+  const afterServers: Record<string, MCPServer> = JSON.parse(JSON.stringify(servers));
+
+  for (const [name, server] of Object.entries(afterServers)) {
+    if (isWrapped(server)) { alreadyWrapped.push(name); continue; }
+    server.args = [PROXY_SCRIPT, server.command, ...(server.args ?? [])];
+    server.command = NODE_BIN;
+    server.env = { ...(server.env ?? {}), SOUSMCP_DB: cfg.dbPath };
+    toWrap.push(name);
+  }
+
+  if (dryRun) {
+    process.stdout.write(chalk.bold(`\n${clientName}:\n`));
+    printDryRunDiff(toWrap, servers, afterServers);
+    return;
+  }
+
+  if (!fs.existsSync(backupPath)) {
+    fs.writeFileSync(backupPath, raw, "utf8");
+    ok(`Backed up original ${clientName} config`);
+  }
+
+  claudeCfg.mcpServers = afterServers;
+  fs.writeFileSync(configPath, JSON.stringify(claudeCfg, null, 2), "utf8");
+
+  if (alreadyWrapped.length > 0) info(`Already wrapped: ${alreadyWrapped.join(", ")}`);
+  if (toWrap.length > 0) {
+    ok(`Wrapped ${toWrap.length} MCP server${toWrap.length > 1 ? "s" : ""}: ${toWrap.join(", ")}`);
+  } else {
+    info("All servers were already wrapped — nothing changed.");
+  }
+  if (restartMsg) process.stdout.write(`\n${restartMsg}\n`);
+}
+
 // ── sousmcp install ────────────────────────────────────────────────────────
 
 async function cmdInstall(args: string[]): Promise<void> {
   const { flags } = parseArgs(args);
   const dryRun = flags["dry-run"] === "true";
-  const { configPath, backupPath, clientName, restartMsg } = resolveTarget(flags);
 
+  // One-time first-run initialisation regardless of how many clients we wrap.
   const firstRun = !fs.existsSync(SOUSMCP_DIR);
-
   if (!dryRun) {
     if (firstRun) {
       process.stdout.write(chalk.bold.cyan("\nWelcome to SousMCP\n") +
@@ -197,7 +320,6 @@ async function cmdInstall(args: string[]): Promise<void> {
         "every tool call to a tamper-evident database.\n\n"
       );
     }
-
     fs.mkdirSync(SOUSMCP_DIR, { recursive: true });
     let cfg = loadConfig();
     if (firstRun || !fs.existsSync(CONFIG_FILE)) {
@@ -213,84 +335,47 @@ async function cmdInstall(args: string[]): Promise<void> {
     }
   }
 
-  // ── Resolve config file ──────────────────────────────────────────────────
-  if (!fs.existsSync(configPath)) {
-    if (flags["cursor"] === "true") {
-      warn(`Cursor MCP config not found at ${configPath}`);
-      info("Open Cursor, add an MCP server in settings, then re-run 'sousmcp install --cursor'.");
-    } else if (flags["config"]) {
-      err(`Config file not found: ${configPath}`);
-    } else {
-      printMissingClientMessage();
-    }
-    return;
-  }
-
   if (!fs.existsSync(PROXY_SCRIPT)) {
     err(`Proxy binary not found at ${PROXY_SCRIPT}`);
     info("Run 'npm run build' first.");
     return;
   }
 
-  let raw: string;
-  let claudeCfg: ClaudeConfig;
-  try {
-    raw = fs.readFileSync(configPath, "utf8");
-    claudeCfg = JSON.parse(raw) as ClaudeConfig;
-  } catch (e) {
-    err(`Cannot read ${configPath}: ${String(e)}`);
-    return;
-  }
+  // Determine targets: explicit flag(s) or auto-detect.
+  const explicit = resolveTargets(flags);
+  let targets: ConfigTarget[];
 
-  const cfg = loadConfig();
-  const servers = claudeCfg.mcpServers ?? {};
-
-  // ── Compute what would change ────────────────────────────────────────────
-  const toWrap: string[] = [];
-  const alreadyWrapped: string[] = [];
-  const afterServers: Record<string, MCPServer> = JSON.parse(JSON.stringify(servers));
-
-  for (const [name, server] of Object.entries(afterServers)) {
-    if (isWrapped(server)) { alreadyWrapped.push(name); continue; }
-    server.args = [PROXY_SCRIPT, server.command, ...(server.args ?? [])];
-    server.command = NODE_BIN;
-    server.env = { ...(server.env ?? {}), SOUSMCP_DB: cfg.dbPath };
-    toWrap.push(name);
-  }
-
-  // ── Dry-run: show diff and exit without writing ──────────────────────────
-  if (dryRun) {
-    printDryRunDiff(toWrap, servers, afterServers);
-    return;
-  }
-
-  // ── Apply ────────────────────────────────────────────────────────────────
-  if (!fs.existsSync(backupPath)) {
-    fs.writeFileSync(backupPath, raw, "utf8");
-    ok(`Backed up original ${clientName} config`);
-  }
-
-  claudeCfg.mcpServers = afterServers;
-  fs.writeFileSync(configPath, JSON.stringify(claudeCfg, null, 2), "utf8");
-
-  if (alreadyWrapped.length > 0) info(`Already wrapped: ${alreadyWrapped.join(", ")}`);
-  if (toWrap.length > 0) {
-    ok(`Wrapped ${toWrap.length} MCP server${toWrap.length > 1 ? "s" : ""}: ${toWrap.join(", ")}`);
+  if (explicit.length > 0) {
+    targets = explicit;
   } else {
-    info("All servers were already wrapped — nothing changed.");
+    const detected = detectInstalledClients();
+    if (detected.length === 0) { printMissingClientMessage(); return; }
+
+    process.stdout.write(chalk.bold("\nFound MCP clients:\n"));
+    for (const { client, servers } of detected) {
+      const wrappedCount = Object.values(servers).filter(isWrapped).length;
+      const total = Object.keys(servers).length;
+      process.stdout.write(
+        `  ${chalk.cyan(client.clientName.padEnd(16))}  ${total} server${total !== 1 ? "s" : ""}` +
+        (wrappedCount > 0 ? chalk.dim(` (${wrappedCount} already wrapped)`) : "") + "\n"
+      );
+    }
+    process.stdout.write("\n");
+
+    if (!dryRun && !(await promptYN("Wrap all? [Y/n] "))) return;
+    targets = detected.map(d => d.client);
   }
 
-  process.stdout.write("\n");
-  if (firstRun) {
-    process.stdout.write(
-      chalk.bold.yellow(`Learning mode enabled for ${cfg.learningModeDays} days`) +
-      " — will log and notify but won't block yet.\n\n" +
-      `Run ${chalk.cyan("'sousmcp policies --strict'")} to enforce immediately.\n\n`
-    );
+  for (const target of targets) {
+    await wrapOneTarget(target, dryRun);
   }
-  if (restartMsg) {
+
+  if (!dryRun && firstRun) {
+    const cfg = loadConfig();
     process.stdout.write(
-      `${restartMsg}\n` +
+      "\n" + chalk.bold.yellow(`Learning mode enabled for ${cfg.learningModeDays} days`) +
+      " — will log and notify but won't block yet.\n" +
+      `Run ${chalk.cyan("'sousmcp policies --strict'")} to enforce immediately.\n\n` +
       `  ${chalk.cyan("sousmcp status")}   — check everything is running\n` +
       `  ${chalk.cyan("sousmcp log")}      — see what's been intercepted\n\n`
     );
@@ -301,7 +386,8 @@ async function cmdInstall(args: string[]): Promise<void> {
 
 async function cmdUninstall(args: string[]): Promise<void> {
   const { flags } = parseArgs(args);
-  const { configPath, backupPath, clientName, restartMsg } = resolveTarget(flags);
+  // Default to Claude Desktop when no explicit target given.
+  const { configPath, backupPath, clientName, restartMsg } = resolveTargets(flags)[0] ?? KNOWN_CLIENTS[0];
 
   if (fs.existsSync(backupPath)) {
     // Happy path: restore from backup created at install time.
@@ -351,23 +437,35 @@ async function cmdStatus(): Promise<void> {
 
   heading("SousMCP Status");
 
-  // Installation
-  let installStatus = "Claude Desktop not found";
-  if (fs.existsSync(CLAUDE_CONFIG)) {
-    try {
-      const claudeCfg = JSON.parse(fs.readFileSync(CLAUDE_CONFIG, "utf8")) as ClaudeConfig;
-      const servers = Object.entries(claudeCfg.mcpServers ?? {});
-      const wrapped = servers.filter(([, s]) => isWrapped(s));
-      if (wrapped.length > 0) {
-        installStatus = chalk.green(`active`) + ` (${wrapped.length} server${wrapped.length > 1 ? "s" : ""}: ${wrapped.map(([n]) => n).join(", ")})`;
-      } else if (servers.length === 0) {
-        installStatus = chalk.dim("no MCP servers in Claude Desktop config");
+  // Clients
+  process.stdout.write(chalk.bold("MCP Clients:\n"));
+  const detected = detectInstalledClients();
+  if (detected.length === 0) {
+    process.stdout.write(chalk.dim("  No known MCP clients found — run 'sousmcp install'\n"));
+  } else {
+    for (const { client, servers } of detected) {
+      const entries = Object.entries(servers);
+      const wrapped = entries.filter(([, s]) => isWrapped(s));
+      let status: string;
+      if (entries.length === 0) {
+        status = chalk.dim("no servers configured");
+      } else if (wrapped.length === entries.length) {
+        status = chalk.green(`active`) + ` — ${wrapped.length}/${entries.length} server${entries.length !== 1 ? "s" : ""} wrapped`;
+      } else if (wrapped.length > 0) {
+        status = chalk.yellow(`partial`) + ` — ${wrapped.length}/${entries.length} wrapped`;
       } else {
-        installStatus = chalk.yellow("inactive") + " — run 'sousmcp install' to wrap servers";
+        status = chalk.dim("not wrapped") + " — run 'sousmcp install'";
       }
-    } catch { installStatus = chalk.red("Claude config is invalid JSON"); }
+      process.stdout.write(`  ${chalk.cyan(client.clientName.padEnd(16))}  ${status}\n`);
+      if (wrapped.length > 0) info(wrapped.map(([n]) => n).join(", "));
+    }
   }
-  process.stdout.write(chalk.bold("Installation:  ") + installStatus + "\n");
+  for (const client of KNOWN_CLIENTS) {
+    if (!detected.find(d => d.client.id === client.id)) {
+      process.stdout.write(`  ${chalk.dim(client.clientName.padEnd(16))}  ${chalk.dim("not installed")}\n`);
+    }
+  }
+  process.stdout.write("\n");
 
   // Database
   process.stdout.write(chalk.bold("Database:      ") + cfg.dbPath + "\n");
@@ -780,16 +878,17 @@ function printHelp(): void {
   process.stdout.write(
     `\n${chalk.bold.cyan("SousMCP")} — a transparency layer for MCP agents\n\n` +
     `${chalk.bold("Commands:")}\n` +
-    `  ${chalk.cyan("install")} [--cursor] [--config <path>] [--dry-run]  Wrap MCP servers\n` +
-    `  ${chalk.cyan("uninstall")} [--cursor] [--config <path>]           Restore config\n` +
-    `  ${chalk.cyan("start")}                        Start all configured MCP servers under proxy\n` +
-    `  ${chalk.cyan("status")}                       Show installation and runtime status\n` +
-    `  ${chalk.cyan("doctor")}                       Run health checks and suggest fixes\n` +
-    `  ${chalk.cyan("log")} [--session <id>] [--n N] Pretty-print recent messages\n` +
-    `  ${chalk.cyan("digest")} [--out <file>]        Generate weekly activity digest\n` +
-    `  ${chalk.cyan("export")} --from --to [--out]   Export signed message bundle\n` +
-    `  ${chalk.cyan("verify")} <file>                Verify a signed export bundle\n` +
-    `  ${chalk.cyan("policies")} [--strict|--learning] View / configure policies\n\n`
+    `  ${chalk.cyan("install")} [--client <id>] [--config <path>] [--dry-run]  Wrap MCP servers\n` +
+    `  ${chalk.cyan("uninstall")} [--client <id>] [--config <path>]            Restore config\n` +
+    `  ${chalk.cyan("start")}                         Start all configured MCP servers under proxy\n` +
+    `  ${chalk.cyan("status")}                         Show all clients and runtime status\n` +
+    `  ${chalk.cyan("doctor")}                         Run health checks and suggest fixes\n` +
+    `  ${chalk.cyan("log")} [--session <id>] [--n N]   Pretty-print recent messages\n` +
+    `  ${chalk.cyan("digest")} [--out <file>]           Generate weekly activity digest\n` +
+    `  ${chalk.cyan("export")} --from --to [--out]      Export signed message bundle\n` +
+    `  ${chalk.cyan("verify")} <file>                   Verify a signed export bundle\n` +
+    `  ${chalk.cyan("policies")} [--strict|--learning]  View / configure policies\n\n` +
+    `${chalk.bold("Clients (--client):")}  claude-desktop  cursor  claude-code\n\n`
   );
 }
 

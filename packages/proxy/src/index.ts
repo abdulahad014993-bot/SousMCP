@@ -125,7 +125,7 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
 
   if (action === "pause") {
     let decision: "approve" | "deny" = "approve";
-    try { decision = pauseForApproval(msg, rule!); } catch (err) {
+    try { decision = await pauseForApproval(msg, rule!); } catch (err) {
       logError(err, "Pause approval — defaulting to approve");
     }
     const policyAction = decision === "deny" ? "pause:denied" : "pause:approved";

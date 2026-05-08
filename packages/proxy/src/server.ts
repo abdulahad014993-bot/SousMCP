@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import { log } from "./logger.js";
 import { metrics } from "./metrics.js";
+import { listApprovals, resolveApproval } from "./approvals.js";
 import type { LogStore } from "./store.js";
 import type { PolicyEngine } from "./policy.js";
 
@@ -71,6 +72,22 @@ export function startApiServer(store: LogStore, policy: PolicyEngine, port = 878
 
     app.get("/api/metrics", (_req, res) => {
       res.json(metrics.snapshot());
+    });
+
+    app.get("/api/approvals", (_req, res) => {
+      res.json(listApprovals());
+    });
+
+    app.post("/api/approvals/:id/approve", (req, res) => {
+      const ok = resolveApproval(req.params["id"], "approve");
+      if (ok) res.json({ ok: true, decision: "approve" });
+      else res.status(404).json({ error: "Approval not found or already resolved" });
+    });
+
+    app.post("/api/approvals/:id/deny", (req, res) => {
+      const ok = resolveApproval(req.params["id"], "deny");
+      if (ok) res.json({ ok: true, decision: "deny" });
+      else res.status(404).json({ error: "Approval not found or already resolved" });
     });
 
     app.get("/api/health", (_req, res) => {
