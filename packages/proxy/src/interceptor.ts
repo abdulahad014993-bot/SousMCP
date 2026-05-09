@@ -17,33 +17,39 @@ function makeMessage(raw: string, direction: MessageDirection): InterceptedMessa
 }
 
 // ── Outbound pipe (child → host) ───────────────────────────────────────────
+// When onOutboundTransform is provided, each complete line is passed through it
+// before being written to process.stdout — enabling Layer 1 schema stripping and
+// Layer 3 response compression. Without a transform, lines are forwarded as-is.
 
 function pipeOutbound(
   source: NodeJS.ReadableStream,
-  onOutbound: (msg: InterceptedMessage) => void
+  onOutbound: (msg: InterceptedMessage) => void,
+  onOutboundTransform?: (line: string) => string
 ): void {
   let buffer = "";
   (source as NodeJS.ReadableStream & { setEncoding(e: string): void }).setEncoding("utf8");
 
+  function forwardLine(trimmed: string): void {
+    const forwarded = onOutboundTransform ? onOutboundTransform(trimmed) : trimmed;
+    process.stdout.write(forwarded + "\n");
+    try { onOutbound(makeMessage(forwarded, "outbound")); } catch (err) {
+      log("error", `onOutbound error: ${String(err)}`);
+    }
+  }
+
   source.on("data", (chunk: string) => {
-    process.stdout.write(chunk); // forward immediately — latency matters
     buffer += chunk;
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trimEnd();
-      if (!trimmed) continue;
-      try { onOutbound(makeMessage(trimmed, "outbound")); } catch (err) {
-        log("error", `onOutbound error: ${String(err)}`);
-      }
+      if (trimmed) forwardLine(trimmed);
     }
   });
 
   source.on("end", () => {
     const trimmed = buffer.trimEnd();
-    if (trimmed) {
-      try { onOutbound(makeMessage(trimmed, "outbound")); } catch { /* ignore */ }
-    }
+    if (trimmed) forwardLine(trimmed);
     buffer = "";
   });
 }
@@ -73,7 +79,7 @@ function pipeInbound(
 
       if (result.action === "forward") {
         if (!(childStdin as NodeJS.WritableStream & { destroyed: boolean }).destroyed) {
-          childStdin.write(raw + "\n");
+          childStdin.write((result.modifiedRaw ?? raw) + "\n");
         }
       } else if (result.errorResponse) {
         process.stdout.write(result.errorResponse + "\n");
@@ -106,7 +112,7 @@ function pipeInbound(
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export function startStdioProxy(options: StartStdioProxyOptions): CleanupFn {
-  const { targetCommand, targetArgs, onInbound, onOutbound, onChildSpawn, onChildStderr } = options;
+  const { targetCommand, targetArgs, onInbound, onOutbound, onOutboundTransform, onChildSpawn, onChildStderr } = options;
 
   const child = spawn(targetCommand, targetArgs, {
     stdio: ["pipe", "pipe", "pipe"],
@@ -140,7 +146,7 @@ export function startStdioProxy(options: StartStdioProxyOptions): CleanupFn {
   }
 
   pipeInbound(process.stdin, child.stdin, onInbound);
-  pipeOutbound(child.stdout!, onOutbound);
+  pipeOutbound(child.stdout!, onOutbound, onOutboundTransform);
 
   child.on("exit", (code, signal) => {
     log("info", `Child exited: code=${code} signal=${signal}`);

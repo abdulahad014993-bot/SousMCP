@@ -206,12 +206,17 @@ export function startApiServer(
       app.get("/api/optimizer", (_req, res) => {
         const m = optimizer.getMetrics();
         const cacheStats = store.getCacheStats();
-        const totalCalls = m.cacheHits + m.cacheMisses;
+        const cacheTotal = m.cache.hits + m.cache.misses;
         res.json({
           ...m,
-          cacheHitRate: totalCalls > 0 ? Math.round((m.cacheHits / totalCalls) * 100) : 0,
-          persistedCacheEntries: cacheStats.entries,
-          persistedCacheHits: cacheStats.totalHits,
+          cache: {
+            ...m.cache,
+            hitRate: cacheTotal > 0 ? Math.round((m.cache.hits / cacheTotal) * 100) : 0,
+            persistedEntries: cacheStats.entries,
+            persistedHits: cacheStats.totalHits,
+          },
+          summary: optimizer.getSummaryLine(),
+          startupPattern: optimizer.getStartupPattern(),
         });
       });
     }

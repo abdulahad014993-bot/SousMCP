@@ -117,7 +117,7 @@ export class ExporterManager {
     // Run async, never block the caller
     setImmediate(() => { this._push(entry); });
   }
-
+  
   private _push(entry: LogEntry): void {
     const body = JSON.stringify(entry);
 

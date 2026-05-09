@@ -13,6 +13,9 @@ export interface InboundResult {
   // JSON-RPC response written back to the host when action === "block".
   // May be a cached result (not necessarily an error).
   errorResponse?: string;
+  // When set and action === "forward", this is written to child stdin instead of the original raw line.
+  // Used to translate virtual tool calls (e.g. sousmcp_execute_tool) into real tool calls.
+  modifiedRaw?: string;
 }
 
 export interface StartStdioProxyOptions {
@@ -24,6 +27,9 @@ export interface StartStdioProxyOptions {
   // Called for each complete JSON line from child stdout (child → host).
   // Always forwarded; callback is for observation / logging only.
   onOutbound: (msg: InterceptedMessage) => void;
+  // Optional synchronous transform applied to each outbound line BEFORE forwarding to the host.
+  // Return the (possibly modified) line. Enables Layer 1 (dynamic schema stripping) and Layer 3 (compression).
+  onOutboundTransform?: (line: string) => string;
   // Called once the child process has been spawned (PID available for monitoring).
   onChildSpawn?: (pid: number) => void;
   // Called for each line on child stderr (for subprocess detection heuristics).

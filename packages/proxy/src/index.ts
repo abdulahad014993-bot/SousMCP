@@ -125,43 +125,65 @@ function jsonRpcError(id: unknown, message: string): string {
   return JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32603, message } });
 }
 
-// ── Outbound handler (server → host) ──────────────────────────────────────
+// ── Outbound transform (server → host, runs BEFORE forwarding to host) ────
+// Handles Layer 1 (dynamic schema stripping), Layer 3 (compression), Layer 5 (minification).
+// Also runs quarantine registration and threat analysis on the full (unstripped) tool list.
 
-function onOutbound(msg: InterceptedMessage): void {
-  metrics.recordMessage("outbound");
-  const parsed = msg.parsed as Record<string, unknown> | null;
-  const method = extractMethod(msg.parsed);
-  const params = extractParams(msg.parsed);
-  const id = extractId(msg.parsed);
+function onOutboundTransform(line: string): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(line); } catch { return line; }
+  if (typeof parsed !== "object" || parsed === null) return line;
 
-  // Cache optimizer: store result for a pending tools/call
-  if (parsed && "result" in parsed) {
-    optimizer.cacheResponse(sessionId, id, JSON.stringify(parsed["result"]));
+  const p = parsed as Record<string, unknown>;
+  if (!("result" in p)) return line;
+
+  const result = p["result"] as Record<string, unknown> | null;
+  const id = p["id"];
+
+  // tools/list response: capture full schemas, quarantine, threat, then strip/minify
+  if (result !== null && typeof result === "object" && Array.isArray((result as Record<string, unknown>)["tools"])) {
+    const tools = (result as Record<string, unknown>)["tools"] as Array<{ name: string; inputSchema?: unknown }>;
+
+    // Store FULL schemas for debug endpoint before any stripping
+    toolSchemas.set(serverName, tools);
+
+    // Quarantine registration + threat analysis on real tools
+    const newTools = quarantine.registerToolList(tools, serverName);
+    const report = analyzeToolSet(tools.map(t => t.name));
+    if (report.flags.length > 0) {
+      log("warn", `Threat analysis [${serverName}]: trustScore=${report.trustScore} flags=${report.flags.map(f => f.message).join("; ")}`);
+    }
+    if (newTools.length > 0) {
+      log("info", `Quarantine: ${newTools.length} new tool(s) pending approval: ${newTools.join(", ")}`);
+    }
+
+    // Layers 1 + 5: schema stripping / minification
+    const modifiedTools = optimizer.processToolList(tools, serverName);
+    // Only reserialize if tools were actually changed
+    const toolsChanged = modifiedTools !== (tools as unknown);
+    if (!toolsChanged) return line;
+    return JSON.stringify({ ...p, result: { ...(result as Record<string, unknown>), tools: modifiedTools } });
   }
 
-  // Capture tool schemas from tools/list response for debug endpoint
-  if (parsed && "result" in parsed) {
-    const result = parsed["result"] as Record<string, unknown> | null;
-    if (Array.isArray(result?.["tools"])) {
-      const tools = result["tools"] as Array<{ name: string; inputSchema?: unknown }>;
-      toolSchemas.set(serverName, tools);
-
-      // Register all tools; new ones are auto-quarantined
-      const newTools = quarantine.registerToolList(tools, serverName);
-
-      // Run threat analysis on the tool set
-      const report = analyzeToolSet(tools.map(t => t.name));
-      if (report.flags.length > 0) {
-        log("warn", `Threat analysis [${serverName}]: trustScore=${report.trustScore} flags=${report.flags.map(f => f.message).join("; ")}`);
-      }
-
-      if (newTools.length > 0) {
-        log("info", `Quarantine: ${newTools.length} new tool(s) pending approval: ${newTools.join(", ")}`);
-      }
+  // tools/call result: cache original then compress + filter (Layers 2, 3, 6)
+  if (result !== null && typeof result === "object") {
+    const resultJson = JSON.stringify(result);
+    const processed = optimizer.processOutboundResult(id, resultJson, sessionId);
+    if (processed !== resultJson) {
+      try { return JSON.stringify({ ...p, result: JSON.parse(processed) }); } catch { /* fall through */ }
     }
   }
 
-  // Push to SIEM exporters
+  return line;
+}
+
+// ── Outbound observer (server → host, runs AFTER forwarding) ──────────────
+
+function onOutbound(msg: InterceptedMessage): void {
+  metrics.recordMessage("outbound");
+  const method = extractMethod(msg.parsed);
+  const params = extractParams(msg.parsed);
+
   exporters.push({
     timestamp: new Date().toISOString(),
     sessionId,
@@ -190,8 +212,26 @@ async function onInbound(msg: InterceptedMessage): Promise<InboundResult> {
 
   metrics.recordMessage("inbound");
 
+  // ── Layer 1: Virtual tool interception (sousmcp_* tools) ─────────────
+  if (method === "tools/call" && toolName?.startsWith("sousmcp_")) {
+    // sousmcp_execute_tool: translate to a real tools/call and forward
+    if (toolName === "sousmcp_execute_tool") {
+      const translated = optimizer.translateExecuteTool(toolArgs, id);
+      if (translated) {
+        try { store.logMessage(sessionId, msg.direction, "tools/call", toolArgs, null, "optimizer:virtual-execute"); } catch { /* ignore */ }
+        return { action: "forward", modifiedRaw: translated };
+      }
+    }
+    // All other sousmcp_* tools: handle locally, never forward
+    const synthetic = optimizer.handleVirtualToolCall(toolName, toolArgs, id, serverName);
+    if (synthetic !== null) {
+      try { store.logMessage(sessionId, msg.direction, method, params, null, "optimizer:virtual"); } catch { /* ignore */ }
+      return { action: "block", errorResponse: synthetic };
+    }
+  }
+
   // ── Optimizer: check cache before forwarding ──────────────────────────
-  if (method === "tools/call" && toolName) {
+  if (method === "tools/call" && toolName && !toolName.startsWith("sousmcp_")) {
     const cached = optimizer.checkCache(sessionId, id, toolName, toolArgs);
     if (cached !== null) {
       try { store.logMessage(sessionId, msg.direction, method, params, null, "optimizer:cache-hit"); } catch { /* ignore */ }
@@ -312,6 +352,7 @@ const cleanup = startStdioProxy({
   targetArgs,
   onInbound,
   onOutbound,
+  onOutboundTransform,
   onChildSpawn: (pid) => {
     log("info", `Child PID: ${pid}`);
     agentMonitor?.start(pid, process.env as Record<string, string | undefined>);
