@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ExporterConfig } from "./exporters.js";
+import type { OptimizerConfig } from "./optimizer.js";
 
 export const SOUSMCP_DIR = path.join(os.homedir(), ".sousmcp");
 export const CONFIG_FILE = path.join(SOUSMCP_DIR, "config.json");
@@ -13,6 +15,15 @@ export interface SousMCPConfig {
   logPath: string;
   apiPort: number;
   lastDigest: number | null;
+  // Feature: SIEM exporters
+  exporters: ExporterConfig[];
+  // Feature: token optimizer
+  optimizer: Partial<OptimizerConfig>;
+  // Feature: quarantine
+  quarantineEnabled: boolean;
+  // Feature: agent monitor
+  agentMonitorEnabled: boolean;
+  agentMonitorPollMs: number;
 }
 
 const DEFAULTS: SousMCPConfig = {
@@ -23,6 +34,11 @@ const DEFAULTS: SousMCPConfig = {
   logPath: path.join(SOUSMCP_DIR, "sousmcp.log"),
   apiPort: 8787,
   lastDigest: null,
+  exporters: [],
+  optimizer: {},
+  quarantineEnabled: true,
+  agentMonitorEnabled: true,
+  agentMonitorPollMs: 5000,
 };
 
 export function loadConfig(): SousMCPConfig {

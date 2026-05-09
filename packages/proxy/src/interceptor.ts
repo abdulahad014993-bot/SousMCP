@@ -97,8 +97,6 @@ function pipeInbound(
     const trimmed = buffer.trimEnd();
     if (trimmed) enqueue(trimmed);
     buffer = "";
-    // Forward EOF to the MCP server after the queue drains — if the host
-    // closes its connection the server should also be told to stop.
     queue.then(() => {
       try { childStdin.end(); } catch { /* ignore */ }
     }).catch(() => { /* ignore */ });
@@ -108,15 +106,38 @@ function pipeInbound(
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export function startStdioProxy(options: StartStdioProxyOptions): CleanupFn {
-  const { targetCommand, targetArgs, onInbound, onOutbound } = options;
+  const { targetCommand, targetArgs, onInbound, onOutbound, onChildSpawn, onChildStderr } = options;
 
   const child = spawn(targetCommand, targetArgs, {
-    stdio: ["pipe", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
 
   child.on("error", (err) => {
     log("error", `Child process error: ${String(err)}`);
   });
+
+  // Notify caller of PID so AgentMonitor can start watching
+  if (child.pid !== undefined && onChildSpawn) {
+    // Use setImmediate so the caller's setup finishes before the callback fires
+    setImmediate(() => { onChildSpawn(child.pid!); });
+  }
+
+  // Pipe stderr to our own stderr (MCP server diagnostics) and optionally observe
+  if (child.stderr) {
+    let stderrBuf = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      process.stderr.write(chunk);
+      if (onChildStderr) {
+        stderrBuf += chunk;
+        const lines = stderrBuf.split("\n");
+        stderrBuf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (line.trim()) onChildStderr(line.trim());
+        }
+      }
+    });
+  }
 
   pipeInbound(process.stdin, child.stdin, onInbound);
   pipeOutbound(child.stdout!, onOutbound);

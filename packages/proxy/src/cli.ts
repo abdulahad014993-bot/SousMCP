@@ -17,6 +17,8 @@ import {
   loadConfig, saveConfig, isLearningMode, daysRemainingInLearning,
   SOUSMCP_DIR, CONFIG_FILE,
 } from "./config.js";
+import { QuarantineManager } from "./quarantine.js";
+import { analyzeToolSet, trustLabel } from "./threat-rules.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -511,6 +513,38 @@ async function cmdStatus(): Promise<void> {
     : chalk.dim(`not running (starts automatically with proxy)`);
   process.stdout.write(chalk.bold("API server:    ") + apiStatus + "\n\n");
 
+  // Quarantine stats
+  const qm = new QuarantineManager();
+  const qStats = qm.stats();
+  const qTotal = qStats.trusted + qStats.blocked + qStats.pending;
+  if (qTotal > 0) {
+    process.stdout.write(chalk.bold("Quarantine:    "));
+    process.stdout.write(
+      `${chalk.green(`${qStats.trusted} trusted`)}  ` +
+      `${chalk.red(`${qStats.blocked} blocked`)}  ` +
+      `${chalk.yellow(`${qStats.pending} pending`)}\n`
+    );
+    // Threat scores per server (based on registered tool names)
+    const serverTools = new Map<string, string[]>();
+    for (const t of qm.listAll()) {
+      const list = serverTools.get(t.server) ?? [];
+      list.push(t.name);
+      serverTools.set(t.server, list);
+    }
+    if (serverTools.size > 0) {
+      process.stdout.write(chalk.bold("Threat scores:\n"));
+      for (const [srv, tools] of serverTools) {
+        const report = analyzeToolSet(tools);
+        const label = trustLabel(report.trustScore);
+        const scoreColor = report.trustScore >= 85 ? chalk.green : report.trustScore >= 60 ? chalk.yellow : chalk.red;
+        process.stdout.write(`  ${chalk.cyan(srv.padEnd(20))}  ${scoreColor(`${report.trustScore}/100`)}  ${chalk.dim(label)}`);
+        if (report.toxicPairs.length > 0) process.stdout.write(chalk.red(`  ⚠ ${report.toxicPairs.join(", ")}`));
+        process.stdout.write("\n");
+      }
+    }
+    process.stdout.write("\n");
+  }
+
   // Update check (non-blocking — skip if offline)
   const newer = await checkForUpdate();
   if (newer) {
@@ -659,6 +693,103 @@ async function cmdPolicies(args: string[]): Promise<void> {
     process.stdout.write(chalk.dim(`File: ${policy.filePath}\n`));
     process.stdout.write(chalk.dim("Options: --strict  --learning\n\n"));
   } catch (e) { err(`Could not load policies: ${String(e)}`); }
+}
+
+// ── sousmcp quarantine ─────────────────────────────────────────────────────
+
+async function cmdQuarantine(args: string[]): Promise<void> {
+  const { positional } = parseArgs(args);
+  const [sub, ...rest] = positional;
+  const qm = new QuarantineManager();
+
+  if (!sub || sub === "list") {
+    const tools = qm.listAll();
+    const stats = qm.stats();
+    heading("Quarantine Registry");
+    if (tools.length === 0) {
+      process.stdout.write(chalk.dim("  No tools registered yet.\n\n"));
+      return;
+    }
+    const byServer = new Map<string, typeof tools>();
+    for (const t of tools) {
+      const list = byServer.get(t.server) ?? [];
+      list.push(t);
+      byServer.set(t.server, list);
+    }
+    for (const [server, serverTools] of byServer) {
+      process.stdout.write(chalk.bold(`  ${server}\n`));
+      for (const t of serverTools) {
+        const statusColor =
+          t.status === "trusted"  ? chalk.green(t.status) :
+          t.status === "blocked"  ? chalk.red(t.status) :
+                                    chalk.yellow(t.status);
+        process.stdout.write(`    ${t.name.padEnd(32)} ${statusColor}  ${chalk.dim(t.firstSeen)}\n`);
+      }
+    }
+    process.stdout.write(`\n  ${chalk.green(`${stats.trusted} trusted`)}  ·  ${chalk.red(`${stats.blocked} blocked`)}  ·  ${chalk.yellow(`${stats.pending} pending`)}\n\n`);
+    return;
+  }
+
+  if (sub === "approve" || sub === "deny") {
+    const [toolArg, serverArg] = rest;
+    if (!toolArg) {
+      err(`Usage: sousmcp quarantine ${sub} <tool-name> [server-name]`);
+      return;
+    }
+    const tools = qm.listAll();
+    // Find matching tools (optionally filtered by server)
+    const candidates = tools.filter(t =>
+      t.name === toolArg && (!serverArg || t.server === serverArg)
+    );
+    if (candidates.length === 0) {
+      const all = tools.filter(t => t.name === toolArg);
+      if (all.length > 0) {
+        err(`Tool '${toolArg}' found on different servers: ${all.map(t => t.server).join(", ")}`);
+        info(`Re-run with: sousmcp quarantine ${sub} ${toolArg} <server-name>`);
+      } else {
+        err(`Tool '${toolArg}' not found in quarantine registry`);
+      }
+      return;
+    }
+    for (const t of candidates) {
+      if (sub === "approve") {
+        qm.approve(t.name, t.server);
+        ok(`Approved '${t.name}' from '${t.server}'`);
+      } else {
+        qm.deny(t.name, t.server);
+        ok(`Blocked '${t.name}' from '${t.server}'`);
+      }
+    }
+    return;
+  }
+
+  err(`Unknown quarantine sub-command: ${sub}`);
+  info("Usage: sousmcp quarantine [list|approve|deny] [tool-name] [server-name]");
+}
+
+// ── sousmcp stop ───────────────────────────────────────────────────────────
+
+async function cmdStop(): Promise<void> {
+  const pidFile = path.join(SOUSMCP_DIR, "daemon.pid");
+  if (!fs.existsSync(pidFile)) {
+    warn("No daemon PID file found — daemon may not be running.");
+    return;
+  }
+  const pidStr = fs.readFileSync(pidFile, "utf8").trim();
+  const pid = parseInt(pidStr, 10);
+  if (isNaN(pid)) {
+    err(`Invalid PID in ${pidFile}`);
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    fs.unlinkSync(pidFile);
+    ok(`Sent SIGTERM to daemon (pid ${pid})`);
+  } catch (e) {
+    err(`Could not stop daemon (pid ${pid}): ${String(e)}`);
+    info("It may have already exited. Removing stale PID file.");
+    try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+  }
 }
 
 // ── sousmcp start ──────────────────────────────────────────────────────────
@@ -880,14 +1011,18 @@ function printHelp(): void {
     `${chalk.bold("Commands:")}\n` +
     `  ${chalk.cyan("install")} [--client <id>] [--config <path>] [--dry-run]  Wrap MCP servers\n` +
     `  ${chalk.cyan("uninstall")} [--client <id>] [--config <path>]            Restore config\n` +
-    `  ${chalk.cyan("start")}                         Start all configured MCP servers under proxy\n` +
-    `  ${chalk.cyan("status")}                         Show all clients and runtime status\n` +
-    `  ${chalk.cyan("doctor")}                         Run health checks and suggest fixes\n` +
-    `  ${chalk.cyan("log")} [--session <id>] [--n N]   Pretty-print recent messages\n` +
-    `  ${chalk.cyan("digest")} [--out <file>]           Generate weekly activity digest\n` +
-    `  ${chalk.cyan("export")} --from --to [--out]      Export signed message bundle\n` +
-    `  ${chalk.cyan("verify")} <file>                   Verify a signed export bundle\n` +
-    `  ${chalk.cyan("policies")} [--strict|--learning]  View / configure policies\n\n` +
+    `  ${chalk.cyan("start")}                              Start all configured MCP servers under proxy\n` +
+    `  ${chalk.cyan("stop")}                               Stop the running daemon\n` +
+    `  ${chalk.cyan("status")}                             Show clients, quarantine stats, threat scores\n` +
+    `  ${chalk.cyan("doctor")}                             Run health checks and suggest fixes\n` +
+    `  ${chalk.cyan("log")} [--session <id>] [--n N]       Pretty-print recent messages\n` +
+    `  ${chalk.cyan("digest")} [--out <file>]               Generate weekly activity digest\n` +
+    `  ${chalk.cyan("export")} --from --to [--out]          Export signed message bundle\n` +
+    `  ${chalk.cyan("verify")} <file>                       Verify a signed export bundle\n` +
+    `  ${chalk.cyan("policies")} [--strict|--learning]      View / configure policies\n` +
+    `  ${chalk.cyan("quarantine")} [list]                   List all registered tools by status\n` +
+    `  ${chalk.cyan("quarantine")} approve <tool> [server]  Mark a tool as trusted\n` +
+    `  ${chalk.cyan("quarantine")} deny <tool> [server]     Permanently block a tool\n\n` +
     `${chalk.bold("Clients (--client):")}  claude-desktop  cursor  claude-code\n\n`
   );
 }
@@ -899,17 +1034,19 @@ const [cmd, ...rest] = process.argv.slice(2);
 (async () => {
   try {
     switch (cmd) {
-      case "install":   await cmdInstall(rest); break;
-      case "uninstall": await cmdUninstall(rest); break;
-      case "start":     await cmdStart(); break;
-      case "status":    await cmdStatus(); break;
-      case "doctor":    await cmdDoctor(); break;
-      case "log":       await cmdLog(rest); break;
-      case "digest":    await cmdDigest(rest); break;
-      case "export":    await cmdExport(rest); break;
-      case "verify":    await cmdVerify(rest); break;
-      case "policies":  await cmdPolicies(rest); break;
-      default:          printHelp(); if (cmd) process.exit(1);
+      case "install":    await cmdInstall(rest); break;
+      case "uninstall":  await cmdUninstall(rest); break;
+      case "start":      await cmdStart(); break;
+      case "stop":       await cmdStop(); break;
+      case "status":     await cmdStatus(); break;
+      case "doctor":     await cmdDoctor(); break;
+      case "log":        await cmdLog(rest); break;
+      case "digest":     await cmdDigest(rest); break;
+      case "export":     await cmdExport(rest); break;
+      case "verify":     await cmdVerify(rest); break;
+      case "policies":   await cmdPolicies(rest); break;
+      case "quarantine": await cmdQuarantine(rest); break;
+      default:           printHelp(); if (cmd) process.exit(1);
     }
   } catch (e) {
     err(`Unexpected error: ${String(e)}`);

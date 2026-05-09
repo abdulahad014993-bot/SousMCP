@@ -1,6 +1,7 @@
 import { DatabaseSync as DB } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type { MessageDirection } from "@sousmcp/shared";
+import type { ActivitySource } from "./agent-monitor.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -23,6 +24,23 @@ export interface MessageRow {
   policyAction: string | null;
   prevHash: string;
   hash: string;
+}
+
+export interface ActivityRow {
+  id: string;
+  timestamp: number;
+  source: ActivitySource;
+  sessionId: string;
+  dataJson: string;
+}
+
+export interface CacheRow {
+  key: string;
+  toolName: string;
+  resultJson: string;
+  createdAt: number;
+  expiresAt: number;
+  hitCount: number;
 }
 
 export interface Stats {
@@ -98,13 +116,23 @@ export class LogStore {
   private readonly stmtMethodCounts: Stmt;
   private readonly stmtPolicyEventsInRange: Stmt;
   private readonly stmtMethodsBeforeDate: Stmt;
+  // Cache
+  private readonly stmtGetCache: Stmt;
+  private readonly stmtSetCache: Stmt;
+  private readonly stmtIncrCacheHit: Stmt;
+  private readonly stmtEvictCache: Stmt;
+  private readonly stmtCacheStats: Stmt;
+  // Activity log
+  private readonly stmtInsertActivity: Stmt;
+  private readonly stmtGetActivity: Stmt;
+  private readonly stmtGetActivityAll: Stmt;
 
   constructor(dbPath: string) {
     this.db = new DB(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA synchronous = NORMAL");   // safe with WAL; skips per-write fsync
-    this.db.exec("PRAGMA cache_size = -65536");    // 64 MB page cache
-    this.db.exec("PRAGMA temp_store = MEMORY");    // temp tables stay in RAM
+    this.db.exec("PRAGMA synchronous = NORMAL");
+    this.db.exec("PRAGMA cache_size = -65536");
+    this.db.exec("PRAGMA temp_store = MEMORY");
     this.db.exec("PRAGMA foreign_keys = ON");
 
     this.db.exec(`
@@ -134,9 +162,34 @@ export class LogStore {
 
       CREATE INDEX IF NOT EXISTS idx_messages_timestamp
         ON messages(timestamp);
+
+      CREATE TABLE IF NOT EXISTS tool_cache (
+        key        TEXT    PRIMARY KEY,
+        toolName   TEXT    NOT NULL,
+        resultJson TEXT    NOT NULL,
+        createdAt  INTEGER NOT NULL,
+        expiresAt  INTEGER NOT NULL,
+        hitCount   INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cache_expires
+        ON tool_cache(expiresAt);
+
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id        TEXT    PRIMARY KEY,
+        timestamp INTEGER NOT NULL,
+        source    TEXT    NOT NULL,
+        sessionId TEXT    NOT NULL,
+        dataJson  TEXT    NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_activity_session
+        ON activity_log(sessionId, timestamp);
     `);
 
     try { this.db.exec(`ALTER TABLE messages ADD COLUMN policyAction TEXT`); } catch { /* already exists */ }
+
+    // ── Prepared statements ──────────────────────────────────────────────
 
     this.stmtInsertSession = this.db.prepare(`
       INSERT INTO sessions (id, startedAt, clientName, serverName, serverCommand)
@@ -181,6 +234,39 @@ export class LogStore {
     this.stmtMethodsBeforeDate = this.db.prepare(`
       SELECT DISTINCT method FROM messages WHERE timestamp < ? AND direction = 'inbound'
     `);
+
+    // Cache
+    this.stmtGetCache = this.db.prepare(`
+      SELECT resultJson FROM tool_cache WHERE key = ? AND expiresAt > ?
+    `);
+    this.stmtSetCache = this.db.prepare(`
+      INSERT OR REPLACE INTO tool_cache (key, toolName, resultJson, createdAt, expiresAt, hitCount)
+      VALUES (@key, @toolName, @resultJson, @createdAt, @expiresAt, 0)
+    `);
+    this.stmtIncrCacheHit = this.db.prepare(`
+      UPDATE tool_cache SET hitCount = hitCount + 1 WHERE key = ?
+    `);
+    this.stmtEvictCache = this.db.prepare(`
+      DELETE FROM tool_cache WHERE expiresAt <= ?
+    `);
+    this.stmtCacheStats = this.db.prepare(`
+      SELECT COUNT(*) as entries, SUM(hitCount) as totalHits FROM tool_cache WHERE expiresAt > ?
+    `);
+
+    // Activity log
+    this.stmtInsertActivity = this.db.prepare(`
+      INSERT INTO activity_log (id, timestamp, source, sessionId, dataJson)
+      VALUES (@id, @timestamp, @source, @sessionId, @dataJson)
+    `);
+    this.stmtGetActivity = this.db.prepare(`
+      SELECT * FROM activity_log WHERE sessionId = ? ORDER BY timestamp ASC
+    `);
+    this.stmtGetActivityAll = this.db.prepare(`
+      SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 200
+    `);
+
+    // Evict expired cache entries on startup
+    try { this.stmtEvictCache.run(Date.now()); } catch { /* ignore */ }
   }
 
   // ── Session ops ───────────────────────────────────────────────────────────
@@ -213,8 +299,6 @@ export class LogStore {
     result: unknown = null,
     policyAction: string | null = null
   ): void {
-    // On the first message for a session, seed tail hash from DB (one DB read).
-    // All subsequent messages use the in-memory value — zero DB reads on hot path.
     if (!this.tailHash.has(sessionId)) {
       const row = this.stmtLastHash.get(sessionId) as { hash: string } | undefined;
       this.tailHash.set(sessionId, row?.hash ?? GENESIS);
@@ -226,8 +310,6 @@ export class LogStore {
     const resultJson = result !== null ? JSON.stringify(result) : null;
     const hash = computeHash(prevHash, timestamp, direction, method, paramsJson);
 
-    // Advance in-memory tail before returning so the next call chains correctly
-    // even if multiple messages arrive before the async drain fires.
     this.tailHash.set(sessionId, hash);
 
     this.writeQueue.push({
@@ -235,7 +317,6 @@ export class LogStore {
       paramsJson, resultJson, policyAction, prevHash, hash,
     });
 
-    // Flush immediately when the queue is full, otherwise wait for the batch window.
     if (this.writeQueue.length >= LogStore.BATCH_CAP) {
       this.drainNow();
     } else {
@@ -262,8 +343,6 @@ export class LogStore {
       this.db.exec("COMMIT");
     } catch {
       try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
-      // Discard the failed batch — the in-memory chain is still valid and new
-      // messages will continue chaining correctly from the last persisted hash.
     }
   }
 
@@ -276,6 +355,46 @@ export class LogStore {
 
   getMessagesInRange(from: number, to: number): MessageRow[] {
     return this.stmtGetMessagesInRange.all(from, to) as unknown as MessageRow[];
+  }
+
+  // ── Cache ops ─────────────────────────────────────────────────────────────
+
+  getCachedResult(key: string): string | null {
+    const row = this.stmtGetCache.get(key, Date.now()) as { resultJson: string } | undefined;
+    if (!row) return null;
+    try { this.stmtIncrCacheHit.run(key); } catch { /* ignore */ }
+    return row.resultJson;
+  }
+
+  setCachedResult(key: string, toolName: string, resultJson: string, ttlMs: number): void {
+    const now = Date.now();
+    try {
+      this.stmtSetCache.run({ key, toolName, resultJson, createdAt: now, expiresAt: now + ttlMs });
+    } catch { /* ignore */ }
+  }
+
+  getCacheStats(): { entries: number; totalHits: number } {
+    const row = this.stmtCacheStats.get(Date.now()) as { entries: number; totalHits: number | null } | undefined;
+    return { entries: row?.entries ?? 0, totalHits: row?.totalHits ?? 0 };
+  }
+
+  // ── Activity log ops ──────────────────────────────────────────────────────
+
+  logActivity(sessionId: string, source: ActivitySource, data: unknown): void {
+    try {
+      this.stmtInsertActivity.run({
+        id: randomUUID(),
+        timestamp: Date.now(),
+        source,
+        sessionId,
+        dataJson: JSON.stringify(data),
+      });
+    } catch { /* ignore */ }
+  }
+
+  getActivity(sessionId?: string): ActivityRow[] {
+    if (sessionId) return this.stmtGetActivity.all(sessionId) as unknown as ActivityRow[];
+    return this.stmtGetActivityAll.all() as unknown as ActivityRow[];
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────
@@ -323,8 +442,6 @@ export class LogStore {
   }
 
   close(): void {
-    // Drain all pending writes before closing — ensures nothing is lost on
-    // graceful shutdown (SIGTERM/SIGINT handled in index.ts).
     while (this.writeQueue.length > 0) this.drainNow();
     this.db.close();
   }
